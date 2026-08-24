@@ -299,26 +299,23 @@ runEventLoop                                     agent/event.go:39
    }
 ```
 
-### processEvent（三阶段架构）
+### processEvent（五阶段架构）
 
 ```mermaid
 flowchart TD
-  PE["processEvent 三阶段<br/>event.go:81"] --> P1["Phase 1: PluginEngine.Dispatch(ev)<br/>event.go:83-89"]
+  PE["processEvent<br/>event.go:81"] --> P0["Phase 0: 消息幂等去重<br/>相同 message_id 丢弃 (WS 断线重连防重复)"]
+  P0 -->|重复| RET0["return"]
+  P0 -->|新消息| P05["Phase 0.5: 系统级群管理检测<br/>h.GroupMgr.Process (Go 原生)"]
+  P05 -->|consumed=true| RET05["return (刷屏/复读拦截)"]
+  P05 -->|未消费| P1["Phase 1: PluginEngine.Dispatch(ev)<br/>event.go:83-89"]
   P1 -->|consumed=true| RET1["return (插件拦截, 不入 Agent)"]
   P1 -->|ev = result.Event| P2["Phase 2: 仅 message 事件继续<br/>event.go:90-92"]
   P2 -->|PostType!=message 或 Message==nil| RET2["return"]
-  P2 --> P3["Phase 3: 回复策略检查<br/>event.go:94-103"]
+  P2 --> P3["Phase 3: 回复策略快速检查<br/>event.go:94-103"]
   P3 -->|skip_reply 标记| P3S["跳过检查"]
-  P3 -->|getReplySettings → checkReplyStrategyFast| RS{策略}
-  RS -->|never_reply| SKIP["skip"]
-  RS -->|at_only| AT["仅 isAtSelf 通过"]
-  RS -->|relevance| RL["延迟到 dispatchToAgent 后<br/>filterRelevant 批量判断"]
-  RS -->|always| OK["通过"]
+  P3 -->|checkReplyStrategyFast| RL["恒放行 (relevance 唯一策略)"]
   P3S --> D
-  AT --> D["dispatchToAgent(ctx, ev, rs)<br/>event.go:104"]
-  RL --> D
-  OK --> D
-  SKIP --> RET3["return"]
+  RL --> D["dispatchToAgent(ctx, ev, rs)<br/>event.go:104"]
   D --> G["goroutine + ConcurrencyManager.Acquire(chatAreaID)"]
   G --> HM["handleMessage(ctx, ev, chatArea, rs)"]
   HM --> R["ConcurrencyManager.Release(chatAreaID)"]
@@ -329,14 +326,14 @@ flowchart TD
 ```mermaid
 flowchart TD
   HM["handleMessage<br/>event.go:311"] --> M1["msg = 批次最后一条<br/>chatArea 缺失时 getChatArea<br/>event.go:315-324"]
-  M1 --> M2{"聊天黑名单?<br/>isAdmin \|\| ACL.CheckChat"}
-  M2 -->|命中| DROP["丢弃 (不进入 Agent, 不写回 tool msg)<br/>event.go:327-341"]
+  M1 --> M2["filterBlockedEvents 黑名单过滤<br/>命中聊天黑名单丢弃 (含 Admins, 不豁免)<br/>event.go:407-421"]
+  M2 -->|命中| DROP["丢弃 (不进入 Agent, 不写回 tool msg)"]
   M2 -->|未命中| M3["h.Session.GetOrCreate(chatArea.ID)<br/>event.go:344"]
   M3 --> M4["收集批内用户消息(带发言人标识) + Skills.Match<br/>event.go:351-380"]
   M4 --> M5["Loops.Register 活跃循环 (Web 监控页展示)<br/>event.go:388-397"]
-  M5 --> M6["longTermMems / skillMem 读取<br/>event.go:402-413"]
+  M5 --> M6["longTermMems / skillMem 读取<br/>长期记忆 RAG 语义召回首选,<br/>降级 pg_trgm gram → 最近条目<br/>event.go:402-413"]
   M6 --> M7["systemCtx = Prompt.BuildFullContext<br/>工具感知不拼入提示词 (Eino tools 参数)"]
-  M7 --> M8["buildKnowledgeContext: LRU/DB 模糊匹配, 命中拼入<br/>关键词命中 + ILIKE 兜底, 限 5 条, LRU 50 缓存<br/>event.go:415"]
+  M7 --> M8["buildKnowledgeContext: RAG 语义检索首选,<br/>降级关键词 + ILIKE 匹配, 限 5 条<br/>event.go:415"]
   M8 --> M9["buildStickerContext: 表情包标签 + 常用表情拼入指令"]
   M9 --> M10["einoMsgs 组装: system → sessionCtx → Skill: → 短期记忆 → user<br/>event.go:418-437"]
   M10 --> M11["AddShortTermMessage + Session.AppendRecord (Postgres 解耦)<br/>event.go:440-447"]
@@ -471,36 +468,37 @@ flowchart TD
 3. `<-webhookEvents`（仅 `WebhookAdapter != nil`）：调用 `processEvent`。
 4. `<-h.CronJobEvents`：合成 cronjob 事件，`Admins` 从 adapter 重新挂回后喂 `processEvent`。
 
-## 事件分发决策树（processEvent 三阶段）
+## 事件分发决策树（processEvent 五阶段）
 
-`processEvent`（`event.go:81-117`）采用三阶段架构：Plugin 拦截 → 消息过滤 → 回复策略检查 → 异步派发 Agent。
+`processEvent`（`event.go:81-174`）采用五阶段架构：幂等去重 → 群管理检测 → Plugin 拦截 → 消息过滤 → 回复策略检查 → 异步派发 Agent。
 
 ```mermaid
 flowchart TD
-  Start["processEvent(ev)"] --> P1["Phase 1: PluginEngine.Dispatch(ev)"]
+  Start["processEvent(ev)"] --> P0["Phase 0: 消息幂等去重"]
+  P0 -->|重复| D0["return"]
+  P0 -->|新消息| P05["Phase 0.5: 系统级群管理检测"]
+  P05 -->|consumed| D05["return (刷屏/复读)"]
+  P05 --> P1["Phase 1: PluginEngine.Dispatch(ev)"]
   P1 --> C1{"result.Consumed?"}
   C1 -->|是| Done["return (插件拦截)"]
   C1 -->|否| P2["Phase 2: 消息过滤"]
   P2 --> P2C{"PostType=='message'<br/>且 Message != nil?"}
   P2C -->|否| Drop["丢弃"]
-  P2C -->|是| P3["Phase 3: 回复策略检查"]
+  P2C -->|是| P3["Phase 3: 回复策略快速检查"]
   P3 --> P3C{"SkipReply 标记?"}
   P3C -->|是| DA["dispatchToAgent"]
-  P3C -->|否| STR{"ReplyStrategy?"}
-  STR --> never_reply["skip"]
-  STR --> at_only["仅 isAtSelf 通过"]
-  STR --> relevance["filterRelevant: 规则快路径 + 批量判断/缓存/降级"]
-  STR --> always["通过"]
-  at_only --> DA
-  relevance --> DA
-  always --> DA
+  P3C -->|否| STR["relevance（唯一策略）<br/>快速检查恒放行，LLM 判断延后"]
+  STR --> DA
   DA -->|goroutine| CM["ConcurrencyManager.Acquire"]
   CM --> HM["handleMessage"]
   HM --> CMR["ConcurrencyManager.Release"]
 ```
 
-> `isAtSelf`（`reply_strategy.go`）做的是精确 `[CQ:at,qq=<self>]` 匹配；优先用当前 `Adapter.SelfID()` 而非缓存 `SelfQQ`，支持机器人换号后立即生效。
-> relevance 判断优化管线（`filterRelevant` → `relevanceBatchEvaluate`）：@/命令/提及名字 → 必回（0 次 LLM）；噪音消息（纯表情/过短/仅 URL）→ 规则丢弃；其余候选合并为**一次** LLM 批量判断（含图消息标注 `[图片]`，单条候选走原分数判断）。判断结果写 Redis（related=15s 对话轮次放宽 / unrelated=30s 冷却），判断并发全局上限 4、超时可配置（reply_strategy 的 relevance_timeout，默认 10s），失败按 `judge_fail_policy`（drop/reply）降级；群聊刷屏（1s≥5 条）时批窗口拉长到 3s 并降级为只回必回消息。
+> **Phase 0（幂等去重）**：群/私聊的 `message_id` 各自独立递增，key 带 `message_type` 前缀；WS 断线重连/多连接时 OneBot 端重复推送的同一消息直接丢弃（`h.msgDedup.SeenBefore`）。
+>
+> **Phase 0.5（系统级群管理）**：`h.GroupMgr.Process`（Go 原生，先于所有 Lua 插件）。白名单/管理员/排除群豁免 → 违禁言论检测（RAG 语义核实首选，高置信直罚 / 模棱两可送 LLM / 低置信有词送 LLM / 无词放行；RAG 不可用降级关键词）；图片刷屏 / +1 复读 `consumed=true` 拦截不进 Agent。详见下方「群管理检测闸门」章节。
+>
+> `checkReplyStrategyFast` 恒放行：回复策略已收敛为仅 `relevance`（@/命令/提及名字必回由规则快路径保证），LLM 相关性判断延后到 `dispatchToAgent` 的 goroutine 内由 `filterRelevant` 执行（`filterRelevant` → `relevanceBatchEvaluate`）：@/命令/提及名字 → 必回（0 次 LLM）；噪音消息（纯表情/过短/仅 URL）→ 规则丢弃；其余候选合并为**一次** LLM 批量判断（含图消息标注 `[图片]`，单条候选走原分数判断）。判断结果写 Redis（related=15s 对话轮次放宽 / unrelated=30s 冷却），判断并发全局上限 4、超时可配置（relevance_timeout，默认 10s），失败按 `judge_fail_policy`（drop/reply）降级；群聊刷屏（1s≥5 条）时批窗口拉长到 3s 并降级为只回必回消息。
 
 ## 一条消息的全程（OneBot11 → 回执）
 
@@ -521,16 +519,19 @@ sequenceDiagram
   AD->>AD: readLoop/parseEvent → events
   AD->>EL: Adapter.Events()
   EL->>PE: processEvent
+  PE->>PE: Phase 0: 消息幂等去重
+  PE->>PE: Phase 0.5: 群管理检测（刷屏/复读拦截，违禁内部处罚）
   PE->>PE: Phase 1: Plugin.Dispatch
   PE->>PE: Phase 2: 消息过滤
-  PE->>PE: Phase 3: 回复策略检查
+  PE->>PE: Phase 3: 回复策略快速检查（relevance 恒放行）
   PE->>CM: dispatchToAgent (goroutine)
   CM->>CM: Acquire(chatAreaID)
   CM->>HM: handleMessage
   HM->>HM: GetOrCreate ChatArea/Session
-  HM->>HM: ACL.CheckChat (admin 跳过)
-  HM->>HM: Skills.Match + Memory + SkillMemory
+  HM->>HM: filterBlockedEvents 黑名单过滤 (管理员不豁免)
+  HM->>HM: Skills.Match + Memory + SkillMemory<br/>(长期记忆 RAG 语义召回)
   HM->>HM: Prompt.BuildFullContext<br/>(SystemLocked + 长期记忆 + skillMemory)<br/>工具感知交由 Eino tools 参数
+  HM->>HM: buildKnowledgeContext (RAG 语义检索首选)
   HM->>HM: AddShortTermMessage(Redis) + AppendRecord(Postgres)
   HM->>EA: EinoAgent.Run (ReAct 循环, MaxIterations=20)
   EA->>EA: LLM.Chat → 工具调用(同步) → 循环
@@ -540,6 +541,32 @@ sequenceDiagram
   CM->>CM: Release(chatAreaID)
   QQ-->>U: QQ 消息回执
 ```
+
+## 群管理检测闸门（Phase 0.5，系统级）
+
+`internal/agent/groupmgr` 是与定时任务/摸鱼人日历同级的系统功能，替代旧 Lua 插件 `redrock_group_manager`。检测闸门位于 Phase 0（幂等去重）之后、Phase 1（Lua 插件派发）之前，**系统级优先于所有插件**，避免与插件双重检测/重复处罚。
+
+```mermaid
+flowchart TD
+  MSG["群聊消息"] --> EX["豁免检查: 白名单 / 管理员 / 排除群"]
+  EX -->|豁免| RET["放行（不进检测）"]
+  EX --> CARD["推荐卡片文本化（不再直罚）"]
+  CARD --> RAG["RAG 语义核实（第一核实人, 三档阈值）"]
+  RAG -->|score ≥ high_score| PUNISH["直接处罚（无词命中同样直罚）"]
+  RAG -->|low < score < high| LLM["LLM 审核（异常按 fallback_score 分数兜底）"]
+  RAG -->|score ≤ low| LOW["低置信"]
+  LOW -->|有词/卡片命中| LLM
+  LOW -->|无硬信号| PASS["放行"]
+  RAG -.RAG 不可用.| KW["降级关键词路径（= 旧插件行为）"]
+  LLM -->|判定违规| PUNISH
+  PUNISH --> LEARN["学习闭环: 样本入库 + RAG Upsert（越用越准）"]
+```
+
+- 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
+- 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
+- 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）
+- Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md#7-群管理)
+- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步
 
 ## CronJob 注入流
 
@@ -796,12 +823,13 @@ Lua 侧通过 SDK `jn.command.register(path, handlerFn, opts)` 注册，path 可
 |--------|------|------|
 | `log` | 始终 | info/warn/error → slog `[plugin:<name>]` 前缀 |
 | `json` | 始终 | encode/decode |
-| `onebot11` | `onebot11` | 21 个 OneBot11 API（SendAdapter 接口桥接） |
-| `http` | `http` | get/post，30s 超时真实 HTTP |
+| `onebot11` | `onebot11` | OneBot11 API（发送/群管理/请求处理/合并转发/引用回复等） |
+| `http` | `http` | get/post + 异步，30s 超时真实 HTTP（可选 http/socks4/socks5 代理） |
 | `database` | `database` | query/exec（共享 DB；`prefixSQL` 桩未生效，⚠ 任意 SQL） |
 | `cache` | `cache` | get/set/del/exists（`pluggin:<name>:` 前缀命名空间） |
 | `t2i` | `t2i` | generate / generate_url + toggle/is_active/get_config |
 | `sandbox` | `sandbox` | create/exec_shell/exec_python/list/delete + toggle/is_active/get_config |
+| `rag` | `rag` | add/add_async/search/search_async（对接 RAG-Service） |
 | `agent` | `agent` | 配置查询 + Provider/MCP/Tool 切换 + switch_provider + compact_memory |
 | `jn.command` | 内置 | 命令注册 |
 
