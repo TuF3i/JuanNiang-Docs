@@ -182,7 +182,7 @@ local info, err = jn.onebot11.get_group_info(987654321)
 | `http.get(url [, proxy]) → table` | `{status=number, body=string}` | GET，30s 超时；`proxy` 可选（见下） |
 | `http.post(url [, content_type, body, proxy]) → table` | `{status, body}` | POST，30s 超时 |
 | `http.get_async(url [, ctx, headers, proxy]) → number` | `req_id` | GET 异步版：立即返回，完成回调 `on_http_response`（不阻塞事件循环）；可选第 3 位 `headers` 表（`{ ["User-Agent"]="...", ["Referer"]="..." }`）用于反爬/风控站点（如微信公众号）；第 4 位 `proxy` 字符串；也可传第 2 位 opts 表 `{proxy=…, headers=…, ctx=…}` |
-| `http.post_async(url [, content_type, body, proxy, ctx]) → number` | `req_id` | POST 异步版；第 4 位为 `proxy` 字符串时 `ctx` 后移至第 5 位 |
+| `http.post_async(url [, content_type, body, proxy, ctx]) → number` | `req_id` | POST 异步版；第 4 位为 `proxy` 字符串时 `ctx` 后移至第 5 位；也可把最后一个参数传 opts 表 `{proxy=…, headers=…, ctx=…}`（`headers` 与 get_async 同款，第 4 位 proxy 与 opts.proxy 同时出现时以 opts 为准） |
 
 **可选代理 `proxy`**（http/socks4/socks5，向后兼容——不传即直连）：
 
@@ -192,7 +192,7 @@ local info, err = jn.onebot11.get_group_info(987654321)
 | `socks5://[user:pass@]host:port` | SOCKS5（支持用户名密码） |
 | `socks4://host:port` / `socks4a://host:port` | SOCKS4（域名目标自动走 SOCKS4a） |
 
-非法协议返回明确错误；按代理地址缓存 `http.Client` 复用连接池，socks 拨号时自动清空环境 HTTP 代理避免双代理冲突。
+非法协议返回明确错误；按代理地址缓存 `http.Client` 复用连接池（**LRU 上限 64**，超出淘汰最久未使用并关闭其空闲连接），socks 拨号时自动清空环境 HTTP 代理避免双代理冲突；SOCKS4/4a 握手内置 10s 超时（继承调用方 ctx deadline），代理不响应时快速失败而非永久阻塞。
 
 ```lua
 local r, err = jn.http.get("https://api.github.com/repos/x/y")

@@ -17,7 +17,7 @@
 <meta name="twitter:description" content="基于 OneBot11 协议的 LLM QQ 聊天 Agent，支持插件扩展与二次开发。">
 <meta name="twitter:image:alt" content="JuanNiang-Neo 项目横幅">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"JuanNiang-Neo","alternateName":"卷娘","url":"https://docs.juan.team/","description":"卷娘（JuanNiang）是红岩网校的吉祥物。本仓库由重庆邮电大学红岩网校工作室开发，基于 Go 与 OneBot11 协议接入大模型的 QQ 聊天 Agent，支持 Lua 插件扩展、Web 管理后台与自部署。","inLanguage":"zh-CN","publisher":{"@type":"Organization","name":"重庆邮电大学红岩网校工作室","logo":{"@type":"ImageObject","url":"https://docs.juan.team/img/banner.webp"}}}</script><link rel="stylesheet" href="/assets/css/styles.829013f4.css">
-<script src="/assets/js/runtime~main.34450d0b.js" defer="defer"></script>
+<script src="/assets/js/runtime~main.d50ac6ab.js" defer="defer"></script>
 <script src="/assets/js/main.6886a46a.js" defer="defer"></script>
 </head>
 <body>
@@ -175,12 +175,15 @@
 </ul>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="运行时-2">运行时<a href="#运行时-2" class="hash-link" aria-label="运行时的直接链接" title="运行时的直接链接" translate="no">​</a></h3>
 <ul>
-<li class="">启动时 <code>loadRAGFromDB</code>（<code>cmd/server/main.go</code>）读 <code>rag_configs</code> 单行（<strong>默认未启用</strong>）；<code>Service.OnUpdateRAG</code> 回调：每次 <code>PUT /rag/config</code> 用最新配置重建 <code>*Client</code> 并注入 <code>HagoCenter</code>，停用/失败置 nil（= 降级开关）</li>
+<li class="">启动时 <code>loadRAGFromDB</code>（<code>cmd/server/main.go</code>）读 <code>rag_configs</code> 单行（<strong>默认未启用</strong>），创建客户端后同时注入 <code>HagoCenter.RAGClient</code>（<code>atomic.Pointer</code>）与 <code>Memory.SetRAGClient</code>（Compact 双写记忆向量）；<code>Service.OnUpdateRAG</code> 回调：每次 <code>PUT /rag/config</code> 用最新配置重建 <code>*Client</code> 并注入，停用/失败置 nil（= 降级开关）</li>
 <li class="">客户端经 <code>agentOp.GetRAGClient()</code>（<code>pluggin.AgentOperator</code>）供插件动态获取，热更新即时生效</li>
 <li class=""><strong>tag 隔离</strong>：知识/记忆/群管理词条·样本共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（<code>internal/core/ragtag</code>：<code>k:</code>/<code>m:</code>/<code>w:</code>/<code>s:</code>），互不污染</li>
 </ul>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="降级语义任何-rag-故障都不影响主流程">降级语义（任何 RAG 故障都不影响主流程）<a href="#降级语义任何-rag-故障都不影响主流程" class="hash-link" aria-label="降级语义（任何 RAG 故障都不影响主流程）的直接链接" title="降级语义（任何 RAG 故障都不影响主流程）的直接链接" translate="no">​</a></h3>
-<table><thead><tr><th>调用方</th><th>首选</th><th>降级</th></tr></thead><tbody><tr><td>知识库检索</td><td>RAG 语义检索（命中按分数注入 ≤5 条）</td><td>SQL 关键词 + ILIKE 匹配（接入前行为）</td></tr><tr><td>长期记忆召回</td><td>RAG 向量语义</td><td>pg_trgm gram 候选 → 最近条目（三级降级链）</td></tr><tr><td>群管理违禁检测</td><td>RAG 语义核实（三档阈值）</td><td>关键词路径（= 旧插件行为）</td></tr><tr><td>群管理词条/样本写入</td><td>RAG 可用时同步 Upsert</td><td>未配置静默跳过、失败仅告警</td></tr></tbody></table>
+<blockquote>
+<p>热路径（每轮对话知识注入 / 记忆召回 / 群管理核实）检索均带 <strong>1s 硬超时</strong>（与群管理 <code>ragSearchTimeout</code> 对齐），RAG 服务假死/超时自动走降级，不拖住消息链路；Compact 的记忆向量双写为<strong>异步 goroutine + 5s 快速失败</strong>，不阻塞 Agent 循环。</p>
+</blockquote>
+<table><thead><tr><th>调用方</th><th>首选</th><th>降级</th></tr></thead><tbody><tr><td>知识库检索</td><td>RAG 语义检索（命中按分数注入 ≤5 条）</td><td>SQL 关键词 + ILIKE 匹配（接入前行为）</td></tr><tr><td>长期记忆召回</td><td>RAG 向量语义</td><td>pg_trgm gram 候选 → 最近条目（三级降级链；pg_trgm 扩展创建失败时自动回退最近条目，不阻断启动）</td></tr><tr><td>群管理违禁检测</td><td>RAG 语义核实（三档阈值）</td><td>关键词路径（= 旧插件行为）</td></tr><tr><td>群管理词条/样本写入</td><td>RAG 可用时同步 Upsert</td><td>未配置静默跳过、失败仅告警（<code>rag_synced</code> 仅真实写入成功才置 true）</td></tr></tbody></table>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="接入指南-4">接入指南<a href="#接入指南-4" class="hash-link" aria-label="接入指南的直接链接" title="接入指南的直接链接" translate="no">​</a></h3>
 <ol>
 <li class="">部署 <a href="https://github.com/JuanNiangDev/JuanNiang-RAG-Service" target="_blank" rel="noopener noreferrer" class="">JuanNiang-RAG-Service</a>：<code>make download &amp;&amp; cargo run --release</code>（默认监听 <code>127.0.0.1:3000</code>，可用 <code>RAG_PORT</code> 等环境变量覆盖）</li>

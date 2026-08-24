@@ -17,7 +17,7 @@
 <meta name="twitter:description" content="基于 OneBot11 协议的 LLM QQ 聊天 Agent，支持插件扩展与二次开发。">
 <meta name="twitter:image:alt" content="JuanNiang-Neo 项目横幅">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"JuanNiang-Neo","alternateName":"卷娘","url":"https://docs.juan.team/","description":"卷娘（JuanNiang）是红岩网校的吉祥物。本仓库由重庆邮电大学红岩网校工作室开发，基于 Go 与 OneBot11 协议接入大模型的 QQ 聊天 Agent，支持 Lua 插件扩展、Web 管理后台与自部署。","inLanguage":"zh-CN","publisher":{"@type":"Organization","name":"重庆邮电大学红岩网校工作室","logo":{"@type":"ImageObject","url":"https://docs.juan.team/img/banner.webp"}}}</script><link rel="stylesheet" href="/assets/css/styles.829013f4.css">
-<script src="/assets/js/runtime~main.34450d0b.js" defer="defer"></script>
+<script src="/assets/js/runtime~main.d50ac6ab.js" defer="defer"></script>
 <script src="/assets/js/main.6886a46a.js" defer="defer"></script>
 </head>
 <body>
@@ -209,15 +209,15 @@
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="get-group-mgrwords">GET /group-mgr/words<a href="#get-group-mgrwords" class="hash-link" aria-label="GET /group-mgr/words的直接链接" title="GET /group-mgr/words的直接链接" translate="no">​</a></h3>
 <p>词条列表。<strong>Query</strong> <code>category</code>（<code>black</code>/<code>gray</code>/<code>sensitive</code>，可选）。<strong>data</strong> <code>GroupMgrWordResp[]</code>：<code>id</code>、<code>word</code>、<code>category</code>、<code>source</code>（<code>system</code>/<code>import</code>）、<code>rag_synced</code> bool、<code>rag_tag</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="post-group-mgrwords">POST /group-mgr/words<a href="#post-group-mgrwords" class="hash-link" aria-label="POST /group-mgr/words的直接链接" title="POST /group-mgr/words的直接链接" translate="no">​</a></h3>
-<p>新增词条（RAG 可用时同步写入向量库）。<strong>Body</strong> <code>AddGroupMgrWordReq</code>: <code>word</code>、<code>category</code>。<strong>data</strong> <code>null</code>。</p>
+<p>新增词条（RAG 可用时同步写入向量库；<strong>仅真实写入 RAG 成功才标记 <code>rag_synced=true</code></strong>）。<strong>Body</strong> <code>AddGroupMgrWordReq</code>: <code>word</code>、<code>category</code>。<strong>data</strong> <code>null</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="delete-group-mgrwords">DELETE /group-mgr/words/<!-- -->:id<a href="#delete-group-mgrwords" class="hash-link" aria-label="delete-group-mgrwords的直接链接" title="delete-group-mgrwords的直接链接" translate="no">​</a></h3>
-<p>删除词条（双删 RAG）。<strong>data</strong> <code>null</code>。</p>
+<p>删除词条（软删），<strong>同步清理其派生样本与 RAG 向量（双删）</strong>——删除后不再参与 RAG 检测；软删后可重建同名（部分唯一索引 + 软删行复活）。<strong>data</strong> <code>null</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="post-group-mgrwordsimport">POST /group-mgr/words/import<a href="#post-group-mgrwordsimport" class="hash-link" aria-label="POST /group-mgr/words/import的直接链接" title="POST /group-mgr/words/import的直接链接" translate="no">​</a></h3>
-<p>从 txt 文件导入词条（一行一个）。<strong>multipart/form-data</strong>：<code>file</code>、Query <code>category</code>。<strong>data</strong> <code>{imported, skipped}</code>。</p>
+<p>从 txt 文件导入词条（一行一个）。<strong>限制</strong>：单文件 ≤ 1MB、行数 ≤ 20000，超出返回 <code>40051</code>。<strong>multipart/form-data</strong>：<code>file</code>、Query <code>category</code>。<strong>data</strong> <code>{imported, skipped}</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="post-group-mgrsync-rag">POST /group-mgr/sync-rag<a href="#post-group-mgrsync-rag" class="hash-link" aria-label="POST /group-mgr/sync-rag的直接链接" title="POST /group-mgr/sync-rag的直接链接" translate="no">​</a></h3>
 <p>手动全量同步词条 + 样本到 RAG 向量库（幂等）。<strong>data</strong> <code>{total, failed}</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="get-group-mgrsamples">GET /group-mgr/samples<a href="#get-group-mgrsamples" class="hash-link" aria-label="GET /group-mgr/samples的直接链接" title="GET /group-mgr/samples的直接链接" translate="no">​</a></h3>
-<p>学习闭环样本列表（LLM 确认违规自动入库）。<strong>data</strong> <code>GroupMgrSampleResp[]</code>：<code>id</code>、<code>text</code>、<code>category</code>、<code>source</code>、<code>hit_count</code>、<code>created_at</code>。</p>
+<p>学习闭环样本列表（LLM 确认违规自动入库——<strong>入库的是送审原文，而非 LLM 裁决 JSON</strong>）。<strong>data</strong> <code>GroupMgrSampleResp[]</code>：<code>id</code>、<code>word_id</code>（关联词条 ID，0=非词条派生）、<code>text</code>、<code>category</code>、<code>source</code>、<code>hit_count</code>、<code>created_at</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="delete-group-mgrsamples">DELETE /group-mgr/samples/<!-- -->:id<a href="#delete-group-mgrsamples" class="hash-link" aria-label="delete-group-mgrsamples的直接链接" title="delete-group-mgrsamples的直接链接" translate="no">​</a></h3>
 <p>删除样本（双删 RAG）。<strong>data</strong> <code>null</code>。</p>
 <h3 class="anchor anchorTargetStickyNavbar_xc_0" id="get-group-mgrviolations">GET /group-mgr/violations<a href="#get-group-mgrviolations" class="hash-link" aria-label="GET /group-mgr/violations的直接链接" title="GET /group-mgr/violations的直接链接" translate="no">​</a></h3>

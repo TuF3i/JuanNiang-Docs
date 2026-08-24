@@ -308,19 +308,19 @@ Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `
 词条列表。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
 
 ### POST /group-mgr/words
-新增词条（RAG 可用时同步写入向量库）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
+新增词条（RAG 可用时同步写入向量库；**仅真实写入 RAG 成功才标记 `rag_synced=true`**）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
 
 ### DELETE /group-mgr/words/:id
-删除词条（双删 RAG）。**data** `null`。
+删除词条（软删），**同步清理其派生样本与 RAG 向量（双删）**——删除后不再参与 RAG 检测；软删后可重建同名（部分唯一索引 + 软删行复活）。**data** `null`。
 
 ### POST /group-mgr/words/import
-从 txt 文件导入词条（一行一个）。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
+从 txt 文件导入词条（一行一个）。**限制**：单文件 ≤ 1MB、行数 ≤ 20000，超出返回 `40051`。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
 
 ### POST /group-mgr/sync-rag
 手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
 
 ### GET /group-mgr/samples
-学习闭环样本列表（LLM 确认违规自动入库）。**data** `GroupMgrSampleResp[]`：`id`、`text`、`category`、`source`、`hit_count`、`created_at`。
+学习闭环样本列表（LLM 确认违规自动入库——**入库的是送审原文，而非 LLM 裁决 JSON**）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`text`、`category`、`source`、`hit_count`、`created_at`。
 
 ### DELETE /group-mgr/samples/:id
 删除样本（双删 RAG）。**data** `null`。

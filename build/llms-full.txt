@@ -903,19 +903,19 @@ Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `
 词条列表。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
 
 ### POST /group-mgr/words
-新增词条（RAG 可用时同步写入向量库）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
+新增词条（RAG 可用时同步写入向量库；**仅真实写入 RAG 成功才标记 `rag_synced=true`**）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
 
 ### DELETE /group-mgr/words/:id
-删除词条（双删 RAG）。**data** `null`。
+删除词条（软删），**同步清理其派生样本与 RAG 向量（双删）**——删除后不再参与 RAG 检测；软删后可重建同名（部分唯一索引 + 软删行复活）。**data** `null`。
 
 ### POST /group-mgr/words/import
-从 txt 文件导入词条（一行一个）。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
+从 txt 文件导入词条（一行一个）。**限制**：单文件 ≤ 1MB、行数 ≤ 20000，超出返回 `40051`。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
 
 ### POST /group-mgr/sync-rag
 手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
 
 ### GET /group-mgr/samples
-学习闭环样本列表（LLM 确认违规自动入库）。**data** `GroupMgrSampleResp[]`：`id`、`text`、`category`、`source`、`hit_count`、`created_at`。
+学习闭环样本列表（LLM 确认违规自动入库——**入库的是送审原文，而非 LLM 裁决 JSON**）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`text`、`category`、`source`、`hit_count`、`created_at`。
 
 ### DELETE /group-mgr/samples/:id
 删除样本（双删 RAG）。**data** `null`。
@@ -1243,6 +1243,8 @@ Prometheus 文本格式监控指标（与 `/health` 同级，**无需 JWT**，�
 | 40045 | 插件名不合法（仅允许字母/数字/下划线/连字符） |
 | 40046 | 插件包包含非法路径（疑似 zip-slip 攻击） |
 | 40047 | 系统内置标签不可删除 |
+| 40050 | RAG 配置不存在 |
+| 40051 | 词库导入文件过大（≤1MB）或行数超限（≤20000） |
 | 50000 | 服务器内部错误 |
 
 ## 认证
@@ -1947,14 +1949,15 @@ flowchart TD
   LOW -->|无硬信号| PASS["放行"]
   RAG -.RAG 不可用.| KW["降级关键词路径（= 旧插件行为）"]
   LLM -->|判定违规| PUNISH
-  PUNISH --> LEARN["学习闭环: 样本入库 + RAG Upsert（越用越准）"]
+  PUNISH --> LEARN["学习闭环: 送审原文入库 + RAG Upsert（越用越准）"]
 ```
 
 - 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
 - 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
-- 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）
+- 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）；**/豁免 按群清除违规记录**（不清其他群的三级惩罚阶梯），白名单为全局豁免
 - Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
-- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步
+- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步；**`rag_synced` 仅真实写入成功才置 true**，删除词条时同步清理派生样本与 RAG 向量
+- 健壮性：LLM 审核提示词带 `<USER_TEXT>` 定界符与指令忽略声明（防注入），判 none 且存在黑/敏感词或卡片硬信号时 **fail-closed 直罚**；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障
 
 ## CronJob 注入流
 
@@ -2634,18 +2637,20 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 ### 运行时
 
-- 启动时 `loadRAGFromDB`（`cmd/server/main.go`）读 `rag_configs` 单行（**默认未启用**）；`Service.OnUpdateRAG` 回调：每次 `PUT /rag/config` 用最新配置重建 `*Client` 并注入 `HagoCenter`，停用/失败置 nil（= 降级开关）
+- 启动时 `loadRAGFromDB`（`cmd/server/main.go`）读 `rag_configs` 单行（**默认未启用**），创建客户端后同时注入 `HagoCenter.RAGClient`（`atomic.Pointer`）与 `Memory.SetRAGClient`（Compact 双写记忆向量）；`Service.OnUpdateRAG` 回调：每次 `PUT /rag/config` 用最新配置重建 `*Client` 并注入，停用/失败置 nil（= 降级开关）
 - 客户端经 `agentOp.GetRAGClient()`（`pluggin.AgentOperator`）供插件动态获取，热更新即时生效
 - **tag 隔离**：知识/记忆/群管理词条·样本共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（`internal/core/ragtag`：`k:`/`m:`/`w:`/`s:`），互不污染
 
 ### 降级语义（任何 RAG 故障都不影响主流程）
 
+> 热路径（每轮对话知识注入 / 记忆召回 / 群管理核实）检索均带 **1s 硬超时**（与群管理 `ragSearchTimeout` 对齐），RAG 服务假死/超时自动走降级，不拖住消息链路；Compact 的记忆向量双写为**异步 goroutine + 5s 快速失败**，不阻塞 Agent 循环。
+
 | 调用方 | 首选 | 降级 |
 |--------|------|------|
 | 知识库检索 | RAG 语义检索（命中按分数注入 ≤5 条） | SQL 关键词 + ILIKE 匹配（接入前行为） |
-| 长期记忆召回 | RAG 向量语义 | pg_trgm gram 候选 → 最近条目（三级降级链） |
+| 长期记忆召回 | RAG 向量语义 | pg_trgm gram 候选 → 最近条目（三级降级链；pg_trgm 扩展创建失败时自动回退最近条目，不阻断启动） |
 | 群管理违禁检测 | RAG 语义核实（三档阈值） | 关键词路径（= 旧插件行为） |
-| 群管理词条/样本写入 | RAG 可用时同步 Upsert | 未配置静默跳过、失败仅告警 |
+| 群管理词条/样本写入 | RAG 可用时同步 Upsert | 未配置静默跳过、失败仅告警（`rag_synced` 仅真实写入成功才置 true） |
 
 ### 接入指南
 
@@ -6606,7 +6611,7 @@ local info, err = jn.onebot11.get_group_info(987654321)
 | `http.get(url [, proxy]) → table` | `{status=number, body=string}` | GET，30s 超时；`proxy` 可选（见下） |
 | `http.post(url [, content_type, body, proxy]) → table` | `{status, body}` | POST，30s 超时 |
 | `http.get_async(url [, ctx, headers, proxy]) → number` | `req_id` | GET 异步版：立即返回，完成回调 `on_http_response`（不阻塞事件循环）；可选第 3 位 `headers` 表（`{ ["User-Agent"]="...", ["Referer"]="..." }`）用于反爬/风控站点（如微信公众号）；第 4 位 `proxy` 字符串；也可传第 2 位 opts 表 `{proxy=…, headers=…, ctx=…}` |
-| `http.post_async(url [, content_type, body, proxy, ctx]) → number` | `req_id` | POST 异步版；第 4 位为 `proxy` 字符串时 `ctx` 后移至第 5 位 |
+| `http.post_async(url [, content_type, body, proxy, ctx]) → number` | `req_id` | POST 异步版；第 4 位为 `proxy` 字符串时 `ctx` 后移至第 5 位；也可把最后一个参数传 opts 表 `{proxy=…, headers=…, ctx=…}`（`headers` 与 get_async 同款，第 4 位 proxy 与 opts.proxy 同时出现时以 opts 为准） |
 
 **可选代理 `proxy`**（http/socks4/socks5，向后兼容——不传即直连）：
 
@@ -6616,7 +6621,7 @@ local info, err = jn.onebot11.get_group_info(987654321)
 | `socks5://[user:pass@]host:port` | SOCKS5（支持用户名密码） |
 | `socks4://host:port` / `socks4a://host:port` | SOCKS4（域名目标自动走 SOCKS4a） |
 
-非法协议返回明确错误；按代理地址缓存 `http.Client` 复用连接池，socks 拨号时自动清空环境 HTTP 代理避免双代理冲突。
+非法协议返回明确错误；按代理地址缓存 `http.Client` 复用连接池（**LRU 上限 64**，超出淘汰最久未使用并关闭其空闲连接），socks 拨号时自动清空环境 HTTP 代理避免双代理冲突；SOCKS4/4a 握手内置 10s 超时（继承调用方 ctx deadline），代理不响应时快速失败而非永久阻塞。
 
 ```lua
 local r, err = jn.http.get("https://api.github.com/repos/x/y")
