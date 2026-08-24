@@ -75,14 +75,18 @@ jn.file.append_line("data/log.txt", "事件发生于 " .. os.date())
 
 | 函数 | 说明 |
 |------|------|
-| `onebot11.send_private_msg(user_id, message) → bool, string` | **异步发送**私聊，立即返回。`message` 可为 string 或消息段数组 |
-| `onebot11.send_group_msg(group_id, message) → bool, string` | **异步发送**群聊，立即返回 |
-| `onebot11.send_private_msg_sync(user_id, message) → bool [, err]` | **同步发送**私聊，阻塞等待结果返回 |
-| `onebot11.send_group_msg_sync(group_id, message) → bool [, err]` | **同步发送**群聊，阻塞等待结果返回 |
+| `onebot11.send_private_msg(user_id, message [, reply_to]) → bool, string` | **异步发送**私聊，立即返回。`message` 可为 string 或消息段数组；`reply_to` 为被引用消息 ID（可选），自动在消息前插入引用段 |
+| `onebot11.send_group_msg(group_id, message [, reply_to]) → bool, string` | **异步发送**群聊，立即返回 |
+| `onebot11.send_private_msg_sync(user_id, message [, reply_to]) → bool [, err]` | **同步发送**私聊，阻塞等待结果返回 |
+| `onebot11.send_group_msg_sync(group_id, message [, reply_to]) → bool [, err]` | **同步发送**群聊，阻塞等待结果返回 |
+| `onebot11.send_group_forward_msg(group_id, nodes) → bool, string` | **异步发送群合并转发**（转发卡片），立即返回；`nodes` 为节点数组（见下） |
+| `onebot11.send_group_forward_msg_sync(group_id, nodes) → number [, err]` | **同步发送群合并转发**，返回 `message_id` |
 | `onebot11.delete_msg(message_id) → bool [, err]` | 撤回消息；`message_id` 接受数字或字符串（事件表的 `message_id` 为字符串，避免 QQ 长 ID 精度丢失） |
 | `onebot11.read_file_base64(path) → string, err` | 从插件目录读取文件并返回 `base64://...` 字符串 |
 
 > **异步 vs 同步**：默认 `send_xxx_msg` 为异步（fire-and-forget），适合大多数场景。需要确认发送结果或获取 `message_id` 时用 `send_xxx_msg_sync`。
+>
+> **引用回复（reply_to）**：`reply_to` 传群/会话内已有消息 ID 即可在发送时自动带出引用卡片；字符串含 CQ 码时先解析为段数组再前插 `reply` 段，参数非法时忽略引用并告警，对存量插件完全兼容。
 
 #### 消息段格式（富文本）
 
@@ -106,6 +110,26 @@ jn.onebot11.send_group_msg(123456, {
 - `http://` / `https://` → 直接透传 URL
 - `base64://` → 直接透传
 - 相对路径（如 `img/photo.png`）→ 从插件目录自动读取并转 base64
+
+#### 合并转发节点格式（`send_group_forward_msg`）
+
+`nodes` 为节点数组，两种节点：
+
+| 节点类型 | 字段 | 说明 |
+|----------|------|------|
+| 构造节点 | `user_id`（number）、`nickname`（string）、`content`（string 或消息段数组） | 自定义发送者与内容（content 自动解析 CQ 码与图床引用） |
+| 引用节点 | `id`（number） | 直接引用群内已有消息 ID |
+
+```lua
+jn.onebot11.send_group_forward_msg(123456, {
+    { user_id = 10001, nickname = "张三", content = "第一条内容" },
+    { user_id = 10002, nickname = "李四", content = {
+        { type = "text", data = { text = "富文本：" } },
+        { type = "image", data = { file = "img/cat.png" } },
+    } },
+    { id = 987654 },
+})
+```
 
 ### 群信息查询
 
@@ -156,10 +180,20 @@ local info, err = jn.onebot11.get_group_info(987654321)
 
 | 函数 | 返回 | 说明 |
 |------|------|------|
-| `http.get(url) → table` | `{status=number, body=string}` | GET，30s 超时 |
-| `http.post(url [, content_type, body]) → table` | `{status, body}` | POST，30s 超时 |
-| `http.get_async(url [, ctx, headers]) → number` | `req_id` | GET 异步版：立即返回，完成回调 `on_http_response`（不阻塞事件循环）；可选第 3 位 `headers` 表（`{ ["User-Agent"]="...", ["Referer"]="..." }`）用于反爬/风控站点（如微信公众号） |
-| `http.post_async(url [, content_type, body, ctx]) → number` | `req_id` | POST 异步版 |
+| `http.get(url [, proxy]) → table` | `{status=number, body=string}` | GET，30s 超时；`proxy` 可选（见下） |
+| `http.post(url [, content_type, body, proxy]) → table` | `{status, body}` | POST，30s 超时 |
+| `http.get_async(url [, ctx, headers, proxy]) → number` | `req_id` | GET 异步版：立即返回，完成回调 `on_http_response`（不阻塞事件循环）；可选第 3 位 `headers` 表（`{ ["User-Agent"]="...", ["Referer"]="..." }`）用于反爬/风控站点（如微信公众号）；第 4 位 `proxy` 字符串；也可传第 2 位 opts 表 `{proxy=…, headers=…, ctx=…}` |
+| `http.post_async(url [, content_type, body, proxy, ctx]) → number` | `req_id` | POST 异步版；第 4 位为 `proxy` 字符串时 `ctx` 后移至第 5 位 |
+
+**可选代理 `proxy`**（http/socks4/socks5，向后兼容——不传即直连）：
+
+| 格式 | 协议 |
+|------|------|
+| `http://host:port` / `https://host:port` | 标准 HTTP 代理 |
+| `socks5://[user:pass@]host:port` | SOCKS5（支持用户名密码） |
+| `socks4://host:port` / `socks4a://host:port` | SOCKS4（域名目标自动走 SOCKS4a） |
+
+非法协议返回明确错误；按代理地址缓存 `http.Client` 复用连接池，socks 拨号时自动清空环境 HTTP 代理避免双代理冲突。
 
 ```lua
 local r, err = jn.http.get("https://api.github.com/repos/x/y")
@@ -289,6 +323,37 @@ function on_sandbox_response(req_id, ctx, result, err)
 end
 ```
 
+## 全局表: `rag`
+
+权限：`rag`。RAG 向量检索（对接独立的 JuanNiang-RAG-Service，bge 模型进程内推理）。**未启用/服务不可达时** `add`/`search` 返回 `(nil, ...)` 错误，不阻塞主流程。
+
+> **tag 契约**：`rag.*` 面向**原始 RAG-Service**——`tag` 必须是 UUID 字符串，全文入库自动分块。不要与主程序知识/记忆/群管理词条内部使用的派生 tag（`k:`/`m:`/`w:`/`s:` 前缀的 UUID v5）混用。
+
+| 函数 | 返回 | 说明 |
+|------|------|------|
+| `rag.add(tag, text) → bool [, err]` | bool | 同步写入（幂等 upsert，长文自动分块） |
+| `rag.add_async(tag, text [, ctx]) → number` | `req_id` | 异步写入，立即返回；完成回调 `on_rag_response`（不阻塞事件循环） |
+| `rag.search(query [, k, min_score]) → RAGHit[] [, err]` | `[{tag, score}]` | 同步检索，按分数降序；`k` 默认 10（1~100），`min_score` 为相似度下限（0~1，建议从 0.5 起步） |
+| `rag.search_async(query [, k, min_score, ctx]) → number` | `req_id` | 异步检索（最后一个 table 参数视为 ctx） |
+
+`RAGHit`: `{tag=string, score=number}`（score 为相似度 0~1，越高越相似；完全相同的文本 ≈0.99+，语义相关通常 0.6~0.95）。
+
+```lua
+-- 同步写入 + 检索
+local ok, err = jn.rag.add("3af2b489-b13a-42e4-af98-fe89d0e6b00e", "要入库的文本")
+local hits, err = jn.rag.search("查询内容", 5, 0.5)
+for _, h in ipairs(hits or {}) do
+    jn.log.info(h.tag .. " score=" .. h.score)
+end
+
+-- 异步：立即返回 req_id，完成回调 on_rag_response
+local rid = jn.rag.search_async("查询内容", 5, 0.5, { group_id = 987654321 })
+function on_rag_response(req_id, ctx, result, err)
+    if err then jn.log.warn("RAG 检索失败: " .. err) return end
+    -- add_async 的 result 为 tag 字符串；search_async 的 result 为 [{tag, score}] 表
+end
+```
+
 ## 全局表: `agent`
 
 权限：`agent`。提供 Agent 配置查询与运行时管理（共 17 个函数）。
@@ -409,6 +474,7 @@ end
 | `t2i` | `t2i.generate_async` / `t2i.generate_url_async` | `on_t2i_response` | `(req_id, ctx, result, err)` |
 | `http` | `http.get_async` / `http.post_async` | `on_http_response` | `(req_id, ctx, result, err)` |
 | `sandbox` | `sandbox.create_async` / `exec_shell_async` / `exec_python_async` | `on_sandbox_response` | `(req_id, ctx, result, err)` |
+| `rag` | `rag.add_async` / `rag.search_async` | `on_rag_response` | `(req_id, ctx, result, err)` |
 
 > **调用现场保存（ctx）**：`t2i` / `http` 异步回调带 `ctx` 参数——调用时把要保留的变量打包成一张表作为最后一个参数传入（如 `generate_async(html, opts, ctx)`），引擎按 `req_id` 关联保存，回调时**原样带回**（不序列化，可含函数）。用于延续调用前的业务状态（待处理消息、群号、临时标记等）；不传则为 `nil`。`llm.chat_async` 不带 `ctx`（回调签名保持 `(req_id, content, err)`，兼容现有插件）。
 >
@@ -626,6 +692,10 @@ function on_sandbox_response(req_id, ctx, result, err)
     -- result: create→{sandbox_id, status}、exec_shell→{output, exit_code}、
     --         exec_python→{output, error}；err 非 nil 表示失败
 end
+
+function on_rag_response(req_id, ctx, result, err)
+    -- result: add_async→tag 字符串、search_async→[{tag, score}] 表；err 非 nil 表示失败
+end
 ```
 
 | 回调 | req_id 来源 | ctx | result |
@@ -633,6 +703,7 @@ end
 | `on_t2i_response(req_id, ctx, result, err)` | `t2i.generate_async` / `t2i.generate_url_async` | 调用现场表（原样带回） | 图片 ID / URL |
 | `on_http_response(req_id, ctx, result, err)` | `http.get_async` / `http.post_async` | 同上 | `{status, body}` |
 | `on_sandbox_response(req_id, ctx, result, err)` | `sandbox.create_async` / `exec_shell_async` / `exec_python_async` | 同上 | 见上注释 |
+| `on_rag_response(req_id, ctx, result, err)` | `rag.add_async` / `rag.search_async` | 同上 | add→tag；search→`[{tag, score}]` |
 
 ```lua
 -- 示例：http 异步 + 现场保存（url 与回调目标一起带到回调）
@@ -659,6 +730,7 @@ end
 | `cache` | `cache.*` |
 | `t2i` | `t2i.*` |
 | `sandbox` | `sandbox.*` |
+| `rag` | `rag.*` |
 | `agent` | `agent.*` |
 | (webhook 调用层过滤) | `on_webhook` 会被调用 |
 | (cronjob 调用层过滤) | `on_cronjob` 会被调用 |
