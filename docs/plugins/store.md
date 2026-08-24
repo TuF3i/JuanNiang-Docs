@@ -20,6 +20,8 @@ plugins/<name>/
 
 `pluggin.yaml` + `main.lua` 为必需；`config.yaml` / `README.md` / `avatar.png` 缺失时插件仍可运行，但商店会标记缺项。
 
+> ⚠️ **`redrock_group_manager` 已系统化**：群管理（违禁言论检测 / 刷屏复读 / 三级惩罚 / 白名单豁免）已升级为主程序 Go 原生系统功能（`internal/agent/groupmgr`，检测闸门位于事件循环 Phase 0.5）。旧 Lua 插件继续存在但**不建议再安装**——与系统功能同时启用会导致双重检测重复处罚。部署时请停用旧插件（Web 群管理页顶部有警告横幅）。
+
 ## 2. 动态配置（config.yaml + jn.config）
 
 ### config.yaml 声明

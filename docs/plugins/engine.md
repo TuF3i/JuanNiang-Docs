@@ -67,6 +67,7 @@ func (pe *PluginEngine) injectBaseAPI(L *lua.LState, pluginName string, permissi
     if plugin.HasPermission("cache")&&pe.cache!=nil     { ... }
     if plugin.HasPermission("t2i")                     { ... }
     if plugin.HasPermission("sandbox")                 { ... }
+    if plugin.HasPermission("rag")                     { ... }
     if plugin.HasPermission("agent")&&pe.dao!=nil      { ... }
 }
 ```
