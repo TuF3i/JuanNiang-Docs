@@ -161,3 +161,43 @@ CronJob 增删改/toggle 后**自动 reload** 调度器（`robfig/cron`，6 字�
 启停，自动 reload。**Body** `ToggleCronJobReq`: `is_active` bool。**data** `null`。
 
 ---
+
+## 8. RAG（向量检索服务）
+
+RAG 向量检索服务配置与健康管理。单行配置（ID=1）。详见 [external-services.md](../external-services.md#rag)。
+
+### GET /rag/config
+**data** `RAGConfigResp`: `base_url`、`timeout` int、`is_active` bool、`healthy` bool。
+
+### PUT /rag/config
+更新配置。运行时若启用则重建客户端并注入 HagoCenter，停用/失败置 nil（触发降级开关）。
+**Body** `UpdateRAGConfigReq`: `base_url`（必填）、`timeout` int（可选）、`is_active` bool（必填）。**data** `RAGConfigResp`。
+
+### GET /rag/health
+实时健康检查（`GET /health`）。**data** `{"healthy": bool}`。
+
+### GET /rag/info
+RAG-Service 服务信息（`GET /info`）：模型状态/进程内存/向量规模。**data**：`model{ready, model_name, dim, n_params, n_threads, n_ctx, error}`、`memory{rss_kb, vsize_kb}`、`tags`、`chunks`。
+
+---
+
+## 9. Metrics（Prometheus）
+
+### GET /metrics
+Prometheus 文本格式监控指标（与 `/health` 同级，**无需 JWT**，前缀 `juanniang_`），覆盖：
+
+| 组 | 指标 |
+|----|------|
+| 消息流 | `juanniang_events_total{post_type}`、`juanniang_messages_total{message_type}`、`juanniang_message_dedup_dropped_total`、`juanniang_message_blocked_total{reason}`、`juanniang_message_dropped_total{reason}` |
+| Agent | `juanniang_agent_loops_total{outcome}`、`juanniang_agent_loops_active`、`juanniang_agent_loop_duration_seconds` |
+| 并发 | `juanniang_agent_concurrency_in_use`、`juanniang_agent_concurrency_waits_total{result}`、`juanniang_agent_concurrency_wait_seconds` |
+| LLM | `juanniang_llm_requests_total{provider,result}`、`juanniang_llm_tokens_total{phase}`、`juanniang_llm_latency_seconds` |
+| 群管理 | `juanniang_groupmgr_violations_total{category,action}`、`_detections_total{path,verdict}`、`_rag_score`、`_llm_reviews_total{result}`、`_spam_total{type}` |
+| RAG | `juanniang_rag_search_latency_seconds`、`juanniang_rag_search_errors_total` |
+| 插件 | `juanniang_plugins_loaded`、`juanniang_plugin_hook_errors_total{plugin,hook}`、`juanniang_plugin_hook_duration_seconds` |
+| HTTP | `juanniang_http_requests_total{method,path,status}`、`juanniang_http_request_duration_seconds` |
+| 库存/健康 | `juanniang_inventory{resource}`、`juanniang_external_health{service}` |
+
+另含 Go runtime（`go_*`）与进程（`process_*`）指标。详情与 Grafana 面板见 [deployment.md 监控章节](../../deployment.md#prometheus-监控)。
+
+---

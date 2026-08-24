@@ -60,7 +60,7 @@ make run-debug                  # 自动读取 dev.yaml + debug 模式
 | `8090` | Web API + 仪表板（前端 SPA 兜底同端口） |
 | `8081` | OneBot11 反向 WebSocket 服务（QQ 机器人框架连接）|
 | `8091` | Webhook HTTP 服务（独立端口，按 `WebhookConfig.Port`，默认关闭）|
-| `3000` | Vite 开发服务器（仅 dev）|
+| `3000` | Vite 开发服务器（仅 dev）；也可作 RAG-Service 默认监听端口 |
 
 ## 构建流程
 
@@ -114,12 +114,50 @@ make lint
 
 > ⚠️ 首次启动前 `mkdir -p data && chmod 777 data`（当前镜像以 root 运行；改为非 root 用户后需按用户赋权）。
 
+## 可选服务：RAG-Service（向量检索）
+
+RAG-Service 是**独立部署**的 Rust 服务（bge 模型进程内推理，零外部依赖），为知识库 / 长期记忆 / 群管理提供语义检索。**不部署也不影响主流程**——全部调用方自动降级为接入前行为。仓库：[JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service)。
+
+```bash
+git clone https://github.com/JuanNiangDev/JuanNiang-RAG-Service && cd JuanNiang-RAG-Service
+make download          # 下载 bge-small-zh-v1.5 GGUF 模型
+cargo run --release    # 默认监听 127.0.0.1:3000
+```
+
+可用环境变量覆盖：`RAG_PORT` / `RAG_N_THREADS` / `RAG_MAX_CTX` 等。API 契约见其 `docs/API.md`（`PUT /tags/{tag}` upsert、`GET /tags/search` 检索、`DELETE /tags/{tag}`、`GET /health`、`GET /info`）。
+
+部署后在 Web 面板「RAG 向量」页填 `base_url`（如 `http://localhost:3000`）并勾选启用；随后可在知识库 / 群管理 / 记忆页面点「同步向量库」做首次全量同步（新增/编辑/删除会自动双写双删，无需手动）。
+
+## Prometheus 监控
+
+`GET /metrics`（与 `/health` 同级，**无需 JWT**）暴露 Prometheus 文本格式指标（前缀 `juanniang_`），覆盖消息流 / Agent / 并发 / LLM / 群管理 / RAG / 插件 / HTTP / 库存 / 外部服务健康 + Go runtime。**注意：`/metrics` 无鉴权，公网暴露需在反代层限源 IP。**
+
+### 采集配置（prometheus.yml）
+
+```yaml
+scrape_configs:
+  - job_name: juanniang
+    scrape_interval: 30s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8090"]
+```
+
+### 建议面板
+
+- **总览**：事件吞吐（`rate(juanniang_events_total[5m])`）、Agent 循环结果（`by outcome`）、LLM 请求（`by provider`）、群管理处罚（`by action`）、外部服务健康（`juanniang_external_health`，0/1）
+- **长尾**：`histogram_quantile(0.95, sum(rate(<xxx>_duration_seconds_bucket[5m])) by (le))` 看 LLM / Agent 循环 / HTTP / RAG 检索延迟
+- **群管理调阈值**：`juanniang_groupmgr_rag_score` 分数分布，对照面板 `high_score` / `low_score`
+- **降级监控**：`juanniang_rag_search_errors_total`、`juanniang_message_dropped_total{reason="irrelevant"}`
+
+完整指标清单见 [Web API：适配器与会话](development/api/infra.md#9-metricsprometheus)。
+
 ## 健康检查
 
 - `GET /health` 二级域名/api 均可：`{"status":"ok"}`，无需鉴权
 - Docker `HEALTHCHECK` 调用的就是它（30s 间隔）
-- `GET /api/v1/overview` 含 `t2i_active`/`t2i_healthy`/`sandbox_active`/`sandbox_healthy`（需 token，前端仪表板调用）
-- `GET /api/v1/t2i/health` / `GET /api/v1/sandbox/health` 实时探活
+- `GET /api/v1/overview` 含 `t2i_active`/`t2i_healthy`/`sandbox_active`/`sandbox_healthy`/`rag_active`/`rag_healthy`（需 token，前端仪表板调用）
+- `GET /api/v1/t2i/health` / `GET /api/v1/sandbox/health` / `GET /api/v1/rag/health` 实时探活；`GET /api/v1/rag/info` 返回模型/内存/向量规模
 
 ## 日志排查
 
@@ -184,8 +222,10 @@ go tool pprof -http :8080 http://127.0.0.1:6060/debug/pprof/heap
 | 启动报 "Postgres 连接失败" | DB_HOST/PORT/USER/PASSWORD/NAME 错；compose 用 `postgres` 主机名 |
 | 启动报 "Redis 連接失败" | REDIS_ADDR/PASSWORD 错；compose 用 `redis:6379` |
 | OneBot 客户端连不上 8081 | OB_TOKEN 不匹配；浏览器访问无 `Authorization: Bearer`；检查防火墙 |
-| LLM 不回复消息 | 1) 没配置/激活 text_model Provider；2) 回复策略设了 `never_reply`；3) ACL 拒绝；4) 群聊不是 @ 也不是 always |
+| LLM 不回复消息 | 1) 没配置/激活 text_model Provider；2) 相关性判断不通过（relevance 策略只回 @/命令/提及名字或高相关消息）；3) ACL 拒绝；4) 群聊静默短语 |
 | Agent 提示"未启用 T2I" | Web 面板 T2I 配置未启用 / `base_url` 不可达；`GET /t2i/health` 为 false |
+| RAG 检索/写入失败 | RAG-Service 未部署或不可达；`GET /rag/health` 为 false。未配置时各调用方自动降级（知识库 SQL 匹配 / 记忆 pg_trgm / 群管理关键词），不报错 |
+| 群管理不生效/重复处罚 | 1) Web 面板群管理未启用；2) 排除群/白名单命中；3) **旧 Lua 插件 `redrock_group_manager` 未停用**（会双重检测重复处罚） |
 | CronJob 不触发 | 留意这是 6 字段（秒级）cron；`0 0 9 * * *` 才是每天 9:00 |
 | 插件改了不生效 | 改 `pluggin.yaml` 必须 reload；改 Lua 文件也要 toggle 后才重新 DoFile |
 | `__NO_REPLY__` 类静默 | Agent LLM 主动判定不回复，检查 system prompt 与回复策略 |
@@ -241,12 +281,13 @@ WantedBy=multi-user.target
 
 1. 准备 Postgres + Redis（或直接 `make docker-up` 用 compose 拉起它们）
 2. 设置 `.env`（至少改 `JWT_SECRET`）
-3. 启动进程；首次会 AutoMigrate 23 张表 + 创建 `admin / Admin123`
+3. 启动进程；首次会 AutoMigrate 39 张表 + 创建 `admin / Admin123`
 4. 立即登录 Web 面板，`POST /change-password` 改默认密码
 5. 在"Providers"页配置 LLM Provider（OpenAI 兼容端点），激活
 6. 在"Adapter"页配置 OB_TOKEN 与 admin QQ，启用
 7. 让 OneBot11 实现（NapCat/Lagrange 等）反向 WS 连 `ws://host:8081/`，带 `Authorization: Bearer <OB_TOKEN>`
-8. 在"回复策略"页配置群聊行为
+8. 在"回复策略"页配置群聊行为（仅 `relevance` 按相关性回复：@/命令/提及名字必回）
+9. 可选：部署 RAG-Service 并在「RAG 向量」页启用（知识库/记忆/群管理自动优先语义检索，未配置自动降级）；启用群管理并停用旧 Lua 插件 `redrock_group_manager` 防止双重处罚
 
 ## FAQ
 

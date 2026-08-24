@@ -39,7 +39,10 @@
 | 改前端页面 | `web/src/views/*.vue`（28 页）、`web/src/api/*`（typed endpoints）、`web/src/router/index.ts` |
 | 改 Plugin SDK | `internal/pluggin/sdk/jn.lua`（`//go:embed`，带 LuaCATS 注解） |
 | 加数据模型 | `internal/core/models/` 加 GORM model + `core.go::AutoMigrate` 注册 + `internal/core/dao/` DAO + `dao.NewBundle` 接入 |
-| 加知识库内容/调匹配策略 | `internal/core/dao/knowledgeDao.go::Match`（关键词+ILIKE 匹配）；`internal/agent/knowledge.go`（LRU/异步提取/注入） |
+| 加知识库内容/调匹配策略 | `internal/core/dao/knowledgeDao.go::Match`（关键词+ILIKE）；`internal/agent/knowledge.go`（LRU/异步提取/注入）；RAG 语义检索入口 `internal/agent/rag.go` + `internal/core/ragtag`（tag 派生） |
+| 接 RAG 向量检索 | `infrastructure/rag/`（客户端）+ `internal/core/dao/ragDao.go`（配置）+ `internal/agent/rag.go`（知识/记忆召回编排）；服务本体在 [JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service) |
+| 改群管理检测 | `internal/agent/groupmgr/`（检测器/惩罚/LLM 审核/RAG 核实）+ `internal/core/dao/groupmgrDao.go` + `internal/api/service/groupmgr.go` + 前端 `web/src/views/GroupMgrPage.vue` |
+| 加 Prometheus 指标 | `internal/metrics/`（指标定义/挂点/HTTP 中间件），事件/Agent/LLM/群管理等埋点在 `internal/agent/event.go`、`agent.go`、`groupmgr/` |
 | 改图床（存储/API/引用解析） | `internal/core/imgstore/`（文件存储）+ `internal/core/dao/imageDao.go`（元数据）+ `internal/api/service/service.go`（上传/校验）+ `internal/adapter/api.go::resolveImageAssets`（imgs:// 解析） |
 | 改表情包库 | `internal/core/dao/stickerDao.go` + `internal/agent/sticker.go`（Agent 工具）+ `internal/pluggin/pluggin.go::injectOneBot11`（send_*_sticker） |
 | 改摸鱼人日历 | `internal/agent/fishcal/fishcal.go`（独立调度器/模板/农历/节假日）+ `internal/core/dao/fishCalDao.go`（配置+按天群务） |
@@ -54,9 +57,12 @@ internal/
   agent/        Agent 核心 — Eino ADK (adk.ChatModelAgent + adk.Runner + ConcurrencyManager)
     provider/   OpenAI 兼容客户端 (Chat / Vision + Eino model adapter)
     mcp/        MCP 客户端 (mark3labs/mcp-go SSE)
-    memory/     记忆子系统: shortterm(Redis 滑窗 100 条 + AutoCompact) / longterm(PG+HotArea) / skillmem(技能记忆)
+    memory/     记忆子系统: shortterm(Redis 滑窗 100 条 + AutoCompact) / longterm(RAG 语义召回→pg_trgm→最近) / skillmem(技能记忆)
+    groupmgr/   群管理（系统级, Phase 0.5 闸门）— RAG 核实/LLM 审核/三级惩罚/刷屏复读/词库样本
+    rag.go      知识/记忆 RAG 语义检索编排 + 降级
     prompt/     系统锁定提示词 + 拼接
     session/    会话 + ChatRecord 持久化
+  metrics/      Prometheus 指标（/metrics 端点 + 运行时 Collector + 全模块挂点）
     skill/      关键词/正则技能匹配
     tool/       ToolRegistry + 内置工具 + Eino InvokableTool 适配 (BuildEinoTools)
     cronjob/    robfig/cron 调度器 (on_cronjob 事件注入)
@@ -66,10 +72,10 @@ internal/
     agent_operator.go   插件 Agent 操作 (SetProviderActive/SwitchProvider/SetMCPActive/SetToolActive/CompactMemory…)
     concurrency.go      每 ChatArea 并发控制 (默认 8 goroutine)
     eino_middleware.go  Eino ADK 中间件 (BeforeAgent 动态指令注入 / AgentLite 工具过滤 / WrapInvokableToolCall 同步执行包装)
-    event.go            三阶段事件循环 (Plugin.Dispatch → ReplyStrategy → dispatchToAgent)
-    reply_strategy.go   回复策略 (NeverReply/AtOnly/Always/Relevance)
+    event.go            五阶段事件循环 (去重 → 群管理 → Plugin.Dispatch → ReplyStrategy → dispatchToAgent)
+    reply_strategy.go   回复策略 (仅 Relevance 按相关性回复)
   api/          Hertz Web (engine + middleware + router + service)
-  core/         Init / dao.Bundle / models (31 表) / acl / cache / imgstore(图床文件存储)
+  core/         Init / dao.Bundle / models (39 表) / acl / cache / imgstore(图床文件存储)
   pluggin/      Lua 引擎 + 命令树 + 内嵌 SDK + 系统插件
   web/          SPAHandler (NoRoute 兜底)
   logging/      fatih/color 彩色 stdout + JSON 格式化 + 调用栈 + Hub(SSE)
@@ -87,12 +93,12 @@ docs/                   本文档树
 | 项 | 状态 |
 |----|------|
 | Adapter 反向 WS / Webhook / API | ✅ 完整实现 |
-| EventLoop / processEvent 三阶段 (Plugin.Dispatch → ReplyStrategy → dispatchToAgent) | ✅ |
+| EventLoop / processEvent 五阶段 (去重 → 群管理 → Plugin.Dispatch → ReplyStrategy → dispatchToAgent) | ✅ |
 | Eino ADK Agent (adk.ChatModelAgent + adk.Runner + ConcurrencyManager) | ✅ |
 | CronJobManager (robfig/cron + on_cronjob 回调) | ✅ |
 | Provider (OpenAI 兼容 + 流式 + Vision) | ✅ |
 | MCP (SSE) | ✅ |
-| Memory (shortterm Redis 100 条滑窗 + AutoCompact / longterm PG+HotArea / skillmem) | ✅ |
+| Memory (shortterm Redis 100 条滑窗 + AutoCompact / longterm RAG 语义召回→pg_trgm→最近 / skillmem) | ✅ |
 | Prompt (SystemLocked + BuildFullContext，工具感知走 Eino tools 参数不拼入提示词) | ✅ |
 | ToolRegistry + 内置工具 | ✅（除 `vision` builtin 只返回提示，真 Vision 走 reply_strategy.go）|
 | Lua 插件引擎 + 命令树 + 系统 SDK + 系统插件 | ✅ |
@@ -130,7 +136,7 @@ docs/                   本文档树
 
 ## 数据模型与持久化策略
 
-- Postgres 拥有**所有**持久状态（23 张表，见 `internal/core/core.go::AutoMigrate`）
+- Postgres 拥有**所有**持久状态（39 张表，见 `internal/core/core.go::AutoMigrate`）
 - Redis 仅作：短期记忆滑动窗口（`shortterm:msgs:<areaID>` List）、PubSub 任务结果通知、插件/Agent 任意缓存
 - `ChatRecord.id` 为自增 int64（不是 UUID，多数表用 UUID），保留这个差异
 - 单行配置表（`Onebot11Adapter`/`WebhookConfig`/`T2IConfig`/`SandboxConfig`）固定 `id=1`，首次 `InitConfig` 用 `OnConflict DoNothing` 建默认行

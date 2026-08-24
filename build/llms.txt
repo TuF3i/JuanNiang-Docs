@@ -13,7 +13,7 @@ This file contains links to documentation sections following the llmstxt.org sta
 - [Web API：接口约定与系统状态](https://docs.juan.team/docs/development/api/intro.md): **Base URL:** `http://localhost:8090/api/v1`
 - [架构与设计（项目细节）](https://docs.juan.team/docs/development/architecture.md): 本文档整合 JuanNiang-Neo 的架构、调用栈、EventLoop 与插件系统，作为二次开发与运维理解的核心参考。
 - [JuanNiang-Neo 项目开发文档](https://docs.juan.team/docs/development.md): 本文档面向二次开发者，整合原 `docs/implementation.md`、`docs/dev/guidance.md`、`docs/dev/provider.md` 中对开发最有价值的内容，按"该读什么、该改什么、不该动什么"组织。代码为准；与 `docs/` 冲突时以代码为准。
-- [外部服务接入细节](https://docs.juan.team/docs/development/external-services.md): 本文档集中说明 JuanNiang-Neo 如何接入外部服务：LLM Provider、MCP、Postgres、Redis、T2I、Sandbox。每节给出：包路径、客户端构造方式、运行时热更新机制、可配置项与启停语义，以及与 HagoCenter / Service 插件的关系。
+- [外部服务接入细节](https://docs.juan.team/docs/development/external-services.md): 本文档集中说明 JuanNiang-Neo 如何接入外部服务：LLM Provider、MCP、Postgres、Redis、T2I、Sandbox、RAG。每节给出：包路径、客户端构造方式、运行时热更新机制、可配置项与启停语义，以及与 HagoCenter / Service 插件的关系。
 - [多协议 LLM Provider 适配实施方案](https://docs.juan.team/docs/development/llm-provider.md): > 状态：待评审（未实施）
 - [本地开发环境](https://docs.juan.team/docs/development/setup.md): 本文面向想在本地搭建开发环境、修改 JuanNiang-Neo 主项目的开发者。
 - [Webhook 与 CronJob 使用文档](https://docs.juan.team/docs/development/webhook-cronjob.md): 本文档说明 JuanNiang-Neo 的两种"主动消息"机制。

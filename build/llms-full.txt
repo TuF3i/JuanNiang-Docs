@@ -64,7 +64,7 @@ make run-debug                  # 自动读取 dev.yaml + debug 模式
 | `8090` | Web API + 仪表板（前端 SPA 兜底同端口） |
 | `8081` | OneBot11 反向 WebSocket 服务（QQ 机器人框架连接）|
 | `8091` | Webhook HTTP 服务（独立端口，按 `WebhookConfig.Port`，默认关闭）|
-| `3000` | Vite 开发服务器（仅 dev）|
+| `3000` | Vite 开发服务器（仅 dev）；也可作 RAG-Service 默认监听端口 |
 
 ## 构建流程
 
@@ -118,12 +118,50 @@ make lint
 
 > ⚠️ 首次启动前 `mkdir -p data && chmod 777 data`（当前镜像以 root 运行；改为非 root 用户后需按用户赋权）。
 
+## 可选服务：RAG-Service（向量检索）
+
+RAG-Service 是**独立部署**的 Rust 服务（bge 模型进程内推理，零外部依赖），为知识库 / 长期记忆 / 群管理提供语义检索。**不部署也不影响主流程**——全部调用方自动降级为接入前行为。仓库：[JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service)。
+
+```bash
+git clone https://github.com/JuanNiangDev/JuanNiang-RAG-Service && cd JuanNiang-RAG-Service
+make download          # 下载 bge-small-zh-v1.5 GGUF 模型
+cargo run --release    # 默认监听 127.0.0.1:3000
+```
+
+可用环境变量覆盖：`RAG_PORT` / `RAG_N_THREADS` / `RAG_MAX_CTX` 等。API 契约见其 `docs/API.md`（`PUT /tags/{tag}` upsert、`GET /tags/search` 检索、`DELETE /tags/{tag}`、`GET /health`、`GET /info`）。
+
+部署后在 Web 面板「RAG 向量」页填 `base_url`（如 `http://localhost:3000`）并勾选启用；随后可在知识库 / 群管理 / 记忆页面点「同步向量库」做首次全量同步（新增/编辑/删除会自动双写双删，无需手动）。
+
+## Prometheus 监控
+
+`GET /metrics`（与 `/health` 同级，**无需 JWT**）暴露 Prometheus 文本格式指标（前缀 `juanniang_`），覆盖消息流 / Agent / 并发 / LLM / 群管理 / RAG / 插件 / HTTP / 库存 / 外部服务健康 + Go runtime。**注意：`/metrics` 无鉴权，公网暴露需在反代层限源 IP。**
+
+### 采集配置（prometheus.yml）
+
+```yaml
+scrape_configs:
+  - job_name: juanniang
+    scrape_interval: 30s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8090"]
+```
+
+### 建议面板
+
+- **总览**：事件吞吐（`rate(juanniang_events_total[5m])`）、Agent 循环结果（`by outcome`）、LLM 请求（`by provider`）、群管理处罚（`by action`）、外部服务健康（`juanniang_external_health`，0/1）
+- **长尾**：`histogram_quantile(0.95, sum(rate(<xxx>_duration_seconds_bucket[5m])) by (le))` 看 LLM / Agent 循环 / HTTP / RAG 检索延迟
+- **群管理调阈值**：`juanniang_groupmgr_rag_score` 分数分布，对照面板 `high_score` / `low_score`
+- **降级监控**：`juanniang_rag_search_errors_total`、`juanniang_message_dropped_total{reason="irrelevant"}`
+
+完整指标清单见 [Web API：适配器与会话](development/api/infra.md#9-metricsprometheus)。
+
 ## 健康检查
 
 - `GET /health` 二级域名/api 均可：`{"status":"ok"}`，无需鉴权
 - Docker `HEALTHCHECK` 调用的就是它（30s 间隔）
-- `GET /api/v1/overview` 含 `t2i_active`/`t2i_healthy`/`sandbox_active`/`sandbox_healthy`（需 token，前端仪表板调用）
-- `GET /api/v1/t2i/health` / `GET /api/v1/sandbox/health` 实时探活
+- `GET /api/v1/overview` 含 `t2i_active`/`t2i_healthy`/`sandbox_active`/`sandbox_healthy`/`rag_active`/`rag_healthy`（需 token，前端仪表板调用）
+- `GET /api/v1/t2i/health` / `GET /api/v1/sandbox/health` / `GET /api/v1/rag/health` 实时探活；`GET /api/v1/rag/info` 返回模型/内存/向量规模
 
 ## 日志排查
 
@@ -188,8 +226,10 @@ go tool pprof -http :8080 http://127.0.0.1:6060/debug/pprof/heap
 | 启动报 "Postgres 连接失败" | DB_HOST/PORT/USER/PASSWORD/NAME 错；compose 用 `postgres` 主机名 |
 | 启动报 "Redis 連接失败" | REDIS_ADDR/PASSWORD 错；compose 用 `redis:6379` |
 | OneBot 客户端连不上 8081 | OB_TOKEN 不匹配；浏览器访问无 `Authorization: Bearer`；检查防火墙 |
-| LLM 不回复消息 | 1) 没配置/激活 text_model Provider；2) 回复策略设了 `never_reply`；3) ACL 拒绝；4) 群聊不是 @ 也不是 always |
+| LLM 不回复消息 | 1) 没配置/激活 text_model Provider；2) 相关性判断不通过（relevance 策略只回 @/命令/提及名字或高相关消息）；3) ACL 拒绝；4) 群聊静默短语 |
 | Agent 提示"未启用 T2I" | Web 面板 T2I 配置未启用 / `base_url` 不可达；`GET /t2i/health` 为 false |
+| RAG 检索/写入失败 | RAG-Service 未部署或不可达；`GET /rag/health` 为 false。未配置时各调用方自动降级（知识库 SQL 匹配 / 记忆 pg_trgm / 群管理关键词），不报错 |
+| 群管理不生效/重复处罚 | 1) Web 面板群管理未启用；2) 排除群/白名单命中；3) **旧 Lua 插件 `redrock_group_manager` 未停用**（会双重检测重复处罚） |
 | CronJob 不触发 | 留意这是 6 字段（秒级）cron；`0 0 9 * * *` 才是每天 9:00 |
 | 插件改了不生效 | 改 `pluggin.yaml` 必须 reload；改 Lua 文件也要 toggle 后才重新 DoFile |
 | `__NO_REPLY__` 类静默 | Agent LLM 主动判定不回复，检查 system prompt 与回复策略 |
@@ -245,12 +285,13 @@ WantedBy=multi-user.target
 
 1. 准备 Postgres + Redis（或直接 `make docker-up` 用 compose 拉起它们）
 2. 设置 `.env`（至少改 `JWT_SECRET`）
-3. 启动进程；首次会 AutoMigrate 23 张表 + 创建 `admin / Admin123`
+3. 启动进程；首次会 AutoMigrate 39 张表 + 创建 `admin / Admin123`
 4. 立即登录 Web 面板，`POST /change-password` 改默认密码
 5. 在"Providers"页配置 LLM Provider（OpenAI 兼容端点），激活
 6. 在"Adapter"页配置 OB_TOKEN 与 admin QQ，启用
 7. 让 OneBot11 实现（NapCat/Lagrange 等）反向 WS 连 `ws://host:8081/`，带 `Authorization: Bearer <OB_TOKEN>`
-8. 在"回复策略"页配置群聊行为
+8. 在"回复策略"页配置群聊行为（仅 `relevance` 按相关性回复：@/命令/提及名字必回）
+9. 可选：部署 RAG-Service 并在「RAG 向量」页启用（知识库/记忆/群管理自动优先语义检索，未配置自动降级）；启用群管理并停用旧 Lua 插件 `redrock_group_manager` 防止双重处罚
 
 ## FAQ
 
@@ -526,31 +567,28 @@ Skill = 关键词/正则触发的 Prompt+Tool 组合配置。`priority` 越大�
 
 系统回复策略（单例，仅一行）。控制群聊中 Agent 对消息的回复行为。
 
-**ReplyStrategy 枚举**
+**策略已收敛为仅 `relevance`**（`never_reply` / `at_only` / `always` 已移除，存量行启动时幂等迁移；`strategy` 字段保留仅作返回展示，PUT 不再接受）。
 
 | 值 | 含义 |
 |----|------|
-| `never_reply` | 完全不回复 |
-| `at_only` | 仅被 @ 时回复 |
-| `always` | 始终回复（默认） |
 | `relevance` | 按相关性回复：@/命令/提及名字必回；噪音消息规则过滤；其余候选批量合并为一次 LLM 判断（受 `relevance_threshold` 影响），带结果缓存/冷却与刷屏降级 |
 
 ### GET /reply-strategy
-获取配置。首次 GET 不存在时自动创建（`strategy=always, relevance_threshold=0.5`）。
+获取配置。首次 GET 不存在时自动创建（`strategy=relevance, relevance_threshold=0.5`）。
 
 **data** `ReplyStrategyResp`: `strategy`、`relevance_threshold` float64、`bot_name`、`strip_markdown` bool、`agent_lite` bool、`relevance_prompt` string、`relevance_model` string、`relevance_timeout` int（相关性判断超时秒，默认 10）、`judge_fail_policy` string（`drop`=判断失败不回复（默认）/ `reply`=照常回复）。
 
 ### PUT /reply-strategy
-更新。
+更新（**`strategy` 字段不再接受，策略固定为 `relevance`**）。
 
-**Body** `UpdateReplyStrategyReq`: `strategy`、`relevance_threshold`（必填）；`bot_name`、`strip_markdown`、`agent_lite`（可选）；`relevance_prompt`（相关性检测自定义提示词，空=默认）、`relevance_model`（相关性检测 Text Provider ID，空=默认）、`relevance_timeout`（相关性判断超时秒，0=默认 10s，范围 1-120）、`judge_fail_policy`（`drop`/`reply`，空=默认 `drop`）。
+**Body** `UpdateReplyStrategyReq`: `relevance_threshold`（必填）；`bot_name`、`strip_markdown`、`agent_lite`（可选）；`relevance_prompt`（相关性检测自定义提示词，空=默认）、`relevance_model`（相关性检测 Text Provider ID，空=默认）、`relevance_timeout`（相关性判断超时秒，0=默认 10s，范围 1-120）、`judge_fail_policy`（`drop`/`reply`，空=默认 `drop`）。
 
 **data** `ReplyStrategyResp`。
 
 ```bash
 curl -X PUT http://localhost:8090/api/v1/reply-strategy \
   -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"strategy":"relevance","relevance_threshold":0.6,"bot_name":"小卷","judge_fail_policy":"reply"}'
+  -d '{"relevance_threshold":0.6,"bot_name":"小卷","judge_fail_policy":"reply"}'
 ```
 
 ---
@@ -626,9 +664,11 @@ curl -X POST http://localhost:8090/api/v1/plugins/upload \
 
 ## 2. 知识库
 
-SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对话前按关键词/内容模糊匹配，命中结果注入系统提示词（LRU 50 条缓存加速）。
+SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对话前**首选 RAG 语义检索**（需配置 RAG-Service），未配置/失败/无命中降级为关键词 + 内容模糊匹配（LRU 50 条缓存加速），命中结果注入系统提示词。
 
 > `keyword_status`：`pending`（提取中，暂不参与匹配）→ `ready`（可匹配）→ `failed`（提取失败，可手动重试）。新增/编辑后自动异步提取关键词。
+>
+> **RAG 双写双删**：新增/编辑知识时同步 Upsert 向量（RAG 未配置静默跳过、失败仅告警），删除时同步删向量；tag 为 UUID v5 派生（`k:<id>`），与记忆/群管理集合隔离。
 
 ### GET /knowledge
 分页列出。**Query** `page`（默认 1）、`page_size`（默认 20，上限 100）。
@@ -651,6 +691,9 @@ SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对
 
 ### POST /knowledge/:id/re-extract
 手动重试关键词提取（`failed` 状态时用）。**data** `null`。
+
+### POST /knowledge/vector-sync
+**手动全量同步向量库**：把全部知识条目批量 Upsert 到 RAG-Service（50 条一批，幂等，可反复触发）。**data** `{total int, failed int}`。
 
 `KnowledgeResp`: `id`、`title`、`content`、`keywords` string[]、`keyword_status`、`created_at`、`updated_at`。
 
@@ -846,6 +889,67 @@ Plugin 与 Agent 发送消息时，用 `[CQ:image,file=imgs://<id>]` 引用图�
 
 ---
 
+## 7. 群管理（系统级）
+
+Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `redrock_group_manager`）：违禁言论检测（RAG 语义核实首选 + LLM 审核 + 学习闭环）、图片刷屏 / +1 复读、入群统计、三级惩罚、白名单/管理员豁免。检测闸门位于事件循环 Phase 0.5（先于所有插件），架构见 [architecture.md](../architecture.md#群管理检测闸门phase-05系统级)。
+
+### GET /group-mgr/config
+读取配置。**data** `GroupMgrConfigResp`：`enabled`、`llm_review`、`high_score`、`low_score`、`fallback_score`、`img_spam_window`、`img_spam_threshold`、`img_mute_duration`、`enable_copy_check`、`copy_threshold`、`violation_mute_seconds`、`exclude_groups` string[]、`llm_criteria`、`llm_gray_prompt`、`llm_high_risk_prompt`。
+
+### PUT /group-mgr/config
+更新配置并热重载（非法值忽略保留原值）。**Body** `UpdateGroupMgrConfigReq`（同 Resp 字段，全部可选）。**data** `GroupMgrConfigResp`。
+
+### GET /group-mgr/words
+词条列表。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
+
+### POST /group-mgr/words
+新增词条（RAG 可用时同步写入向量库）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
+
+### DELETE /group-mgr/words/:id
+删除词条（双删 RAG）。**data** `null`。
+
+### POST /group-mgr/words/import
+从 txt 文件导入词条（一行一个）。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
+
+### POST /group-mgr/sync-rag
+手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
+
+### GET /group-mgr/samples
+学习闭环样本列表（LLM 确认违规自动入库）。**data** `GroupMgrSampleResp[]`：`id`、`text`、`category`、`source`、`hit_count`、`created_at`。
+
+### DELETE /group-mgr/samples/:id
+删除样本（双删 RAG）。**data** `null`。
+
+### GET /group-mgr/violations
+违规记录列表。**data** `GroupMgrViolationResp[]`：`id`、`group_id`、`user_id`、`username`、`count`、`detection_path`（`rag`/`keyword`/`llm`）、`llm_reason`。
+
+### DELETE /group-mgr/violations/:id
+清除违规记录。**data** `null`。
+
+### GET /group-mgr/whitelist / PUT /group-mgr/whitelist
+白名单 QQ 列表。**data** `{qq_list int64[]}`（PUT Body 同）。
+
+### GET /group-mgr/admins / PUT /group-mgr/admins
+手动管理员 QQ 列表。**data** `{qq_list int64[]}`（PUT Body 同）。
+
+### POST /group-mgr/admins/sync-from-adapter
+从 Adapter `AdminQQNumbers` 同步管理员（增量合并）。**data** `{added int}`。
+
+### GET /group-mgr/stats
+群统计（`/groupstats` 命令同源）。**Query** `group_id`、`date`。**data** `GroupMgrStatsResp`：`group_id`、`date`、`join_today`、`warns`、`mutes`、`copy_warns`、`ad`、`sensitive`、`kicks`。
+
+### POST /group-mgr/test
+链路测试（**不处罚、不写库**）：输入文本跑完整判定链，返回各环节结果。**Body** `TestGroupMgrReq`: `text`。**data** `GroupMgrTestResp`（`card`/`word`/`rag_score`/`verdict`/`reason` 等）。
+
+---
+
+## 8. 长期记忆（RAG 同步）
+
+### POST /memory/sync-rag
+手动全量同步长期记忆到 RAG 向量库（补齐 Compact 双写前的历史记忆，幂等）。**data** `{total, failed}`。
+
+---
+
 ## 附：前端 SPA 静态服务
 
 后端复用 Hertz 引擎同端口（`:8090`）服务前端 SPA：
@@ -1021,6 +1125,46 @@ CronJob 增删改/toggle 后**自动 reload** 调度器（`robfig/cron`，6 字�
 
 ### PUT /cronjobs/:id/toggle
 启停，自动 reload。**Body** `ToggleCronJobReq`: `is_active` bool。**data** `null`。
+
+---
+
+## 8. RAG（向量检索服务）
+
+RAG 向量检索服务配置与健康管理。单行配置（ID=1）。详见 [external-services.md](../external-services.md#rag)。
+
+### GET /rag/config
+**data** `RAGConfigResp`: `base_url`、`timeout` int、`is_active` bool、`healthy` bool。
+
+### PUT /rag/config
+更新配置。运行时若启用则重建客户端并注入 HagoCenter，停用/失败置 nil（触发降级开关）。
+**Body** `UpdateRAGConfigReq`: `base_url`（必填）、`timeout` int（可选）、`is_active` bool（必填）。**data** `RAGConfigResp`。
+
+### GET /rag/health
+实时健康检查（`GET /health`）。**data** `{"healthy": bool}`。
+
+### GET /rag/info
+RAG-Service 服务信息（`GET /info`）：模型状态/进程内存/向量规模。**data**：`model{ready, model_name, dim, n_params, n_threads, n_ctx, error}`、`memory{rss_kb, vsize_kb}`、`tags`、`chunks`。
+
+---
+
+## 9. Metrics（Prometheus）
+
+### GET /metrics
+Prometheus 文本格式监控指标（与 `/health` 同级，**无需 JWT**，前缀 `juanniang_`），覆盖：
+
+| 组 | 指标 |
+|----|------|
+| 消息流 | `juanniang_events_total{post_type}`、`juanniang_messages_total{message_type}`、`juanniang_message_dedup_dropped_total`、`juanniang_message_blocked_total{reason}`、`juanniang_message_dropped_total{reason}` |
+| Agent | `juanniang_agent_loops_total{outcome}`、`juanniang_agent_loops_active`、`juanniang_agent_loop_duration_seconds` |
+| 并发 | `juanniang_agent_concurrency_in_use`、`juanniang_agent_concurrency_waits_total{result}`、`juanniang_agent_concurrency_wait_seconds` |
+| LLM | `juanniang_llm_requests_total{provider,result}`、`juanniang_llm_tokens_total{phase}`、`juanniang_llm_latency_seconds` |
+| 群管理 | `juanniang_groupmgr_violations_total{category,action}`、`_detections_total{path,verdict}`、`_rag_score`、`_llm_reviews_total{result}`、`_spam_total{type}` |
+| RAG | `juanniang_rag_search_latency_seconds`、`juanniang_rag_search_errors_total` |
+| 插件 | `juanniang_plugins_loaded`、`juanniang_plugin_hook_errors_total{plugin,hook}`、`juanniang_plugin_hook_duration_seconds` |
+| HTTP | `juanniang_http_requests_total{method,path,status}`、`juanniang_http_request_duration_seconds` |
+| 库存/健康 | `juanniang_inventory{resource}`、`juanniang_external_health{service}` |
+
+另含 Go runtime（`go_*`）与进程（`process_*`）指标。详情与 Grafana 面板见 [deployment.md 监控章节](../../deployment.md#prometheus-监控)。
 
 ---
 
@@ -1253,7 +1397,7 @@ es.addEventListener('log', (e) => {
 
 ## 概述
 
-JuanNiang-Neo 是基于 OneBot11 协议的 LLM QQ 聊天 Agent 系统（红岩网校吉祥物"卷娘"）。核心由 LLM 驱动的对话 Agent（`HagoCenter`，聚合 Provider / MCP / Memory / Prompt / Session / Skill / Tool）与 OneBot11 反向 WebSocket 适配器组成，基于 Eino ADK 框架构建 `ChatModelAgent`，工具调用在 ReAct 循环内同步执行。事件流经三阶段管线：Plugin 拦截 → 回复策略检查 → 异步派发 Agent，每个聊天区域由 `ConcurrencyManager` 控制最多 8 个 Agent goroutine 并发。项目还包含 Lua 插件引擎、Vue 3 管理面板，以及 Postgres + Redis + Sandbox + T2I 等可插拔基础设施。所有持久化状态落 Postgres + Redis，配置与运行时状态均可在 Web 面板热切换。
+JuanNiang-Neo 是基于 OneBot11 协议的 LLM QQ 聊天 Agent 系统（红岩网校吉祥物"卷娘"）。核心由 LLM 驱动的对话 Agent（`HagoCenter`，聚合 Provider / MCP / Memory / Prompt / Session / Skill / Tool）与 OneBot11 反向 WebSocket 适配器组成，基于 Eino ADK 框架构建 `ChatModelAgent`，工具调用在 ReAct 循环内同步执行。事件流经五阶段管线：幂等去重 → 系统级群管理检测 → Plugin 拦截 → 消息过滤 → 回复策略检查 → 异步派发 Agent，每个聊天区域由 `ConcurrencyManager` 控制最多 8 个 Agent goroutine 并发。项目还包含 Lua 插件引擎、Vue 3 管理面板，以及 Postgres + Redis + Sandbox + T2I + RAG 等可插拔基础设施。所有持久化状态落 Postgres + Redis，配置与运行时状态均可在 Web 面板热切换。
 
 ## 分层架构
 
@@ -1269,7 +1413,7 @@ flowchart TB
     API["api/: Hertz Web 引擎 + JWT + 路由 + Service(121 handler)"]
     Plugin["pluggin/: gopher-lua 引擎<br/>生命周期 / API 暴露 / 命令树 / 事件拦截"]
     Agent["agent/: HagoCenter + Eino ADK ChatModelAgent<br/>Provider/MCP/Memory/Prompt/Session/Skill/Tool/ACL<br/>ConcurrencyManager (每 ChatArea 8 goroutine)"]
-    CoreLib["core/: models(23表) / dao.Bundle / cache / acl"]
+    CoreLib["core/: models(39表) / dao.Bundle / cache / acl"]
   end
   subgraph Infra["基础设施层"]
     PG["postgres"]
@@ -1318,7 +1462,7 @@ flowchart TB
 
 ## 数据模型
 
-共 31 个 GORM 表（见 `internal/core/core.go::AutoMigrate`）。
+共 39 个 GORM 表（见 `internal/core/core.go::AutoMigrate`）。
 
 ```mermaid
 classDiagram
@@ -1358,16 +1502,16 @@ classDiagram
 - **`ChatArea`**：私聊/群聊最小隔离单元，是 Session / Memory / ChatRecord / ACLRule 的父级。由首条消息自动 `GetOrCreate` 创建，无手动创建接口。
 - **`ChatRecord`**：`id` 为自增 int64（其他模型多为 UUID）。`Session.AppendRecord` 写 Postgres 与短期记忆 Redis 写入**解耦**——前者为审计/检索，后者为 Agent 上下文窗口。
 - **单行配置**：`Onebot11Adapter`/`WebhookConfig`/`T2IConfig`/`SandboxConfig` 固定 `id=1`，首次访问 DB 不存在时 `InitConfig` 用 `OnConflict DoNothing` 创建默认行。
-- **`ReplyStrategyConfig`**：无 `DeletedAt` 的单例，默认 `strategy=always, relevance_threshold=0.5, judge_fail_policy=drop`。
+- **`ReplyStrategyConfig`**：无 `DeletedAt` 的单例，策略已收敛为仅 `relevance`（默认 `strategy=relevance, relevance_threshold=0.5, judge_fail_policy=drop`）。
 - **Prompt `IsSystem`**：启动时 `EnsureSystemPrompt` 幂等播种 `__system_locked__`，强制拼接（顺序 SystemLocked → system → personality → custom）。
 - **Plugin `Manifest.System`**：系统插件三层守卫（Manifest.System + `PluginEngine.IsSystem()` + Service 层 Toggle/Delete）禁删/禁停。
 - **`CronJob`**：不与 ChatArea 建外键；触发时由 `cronjob.Manager` 构造合成 `adapter.Event{PostType:"cronjob", IsCronJob:true}` 经 `CronJobEvents` channel 注入事件循环。
 - **`SkillMemory`**：全局技能记忆单例（`id="global"`），存储从对话中提取的技能/知识/黑话。Compact 时由 LLM 自动更新，写回 Postgres。
-- **`KnowledgeItem`**：SQL 知识库条目，存入时由 Agent 异步提取 `Keywords`（`keyword_status`: pending→ready/failed）；对话前 `buildKnowledgeContext` 按关键词命中 + 内容 ILIKE 匹配，命中结果注入系统提示词（LRU 50 条缓存）。
+- **`KnowledgeItem`**：SQL 知识库条目，存入时由 Agent 异步提取 `Keywords`（`keyword_status`: pending→ready/failed）；对话前 `buildKnowledgeContext` **首选 RAG 语义检索**（命中按分数注入 ≤5 条），未配置/失败/无命中降级为关键词命中 + 内容 ILIKE 匹配（LRU 50 条缓存）。
 
 ## 状态管理
 
-- **持久化状态** → Postgres（23 张表）
+- **持久化状态** → Postgres（39 张表）
 - **缓存状态** → Redis（短期记忆滑动窗口 `shortterm:msgs:<areaID>`、PubSub 任务结果通知、插件/Agent 任意 KV/Hash）
 - **插件数据隔离** → Cache 键以 `pluggin:<name>:` 前缀命名空间隔离（注意：`database.query` 当前未真正应用前缀，是 `prefixSQL` 桩）
 - **例外** → Lua 插件配置由 `data/pluggins/<name>/pluggin.yaml` 管理（非 DB，便于 bind-mount 跨镜像保留）
@@ -1386,7 +1530,7 @@ flowchart LR
     CJ[("CronJobEvents<br/>robfig/cron 合成")]
   end
   subgraph Loop["runEventLoop (event.go)"]
-    PE["processEvent 三阶段<br/>1.Plugin.Dispatch<br/>2.消息过滤<br/>3.回复策略检查"]
+    PE["processEvent 五阶段<br/>0.幂等去重<br/>0.5.群管理检测<br/>1.Plugin.Dispatch<br/>2.消息过滤<br/>3.回复策略检查"]
     DA["dispatchToAgent<br/>goroutine + ConcurrencyManager"]
     HM["handleMessage<br/>buildCtx→Eino ADK Agent→<br/>sendReply"]
   end
@@ -1543,26 +1687,23 @@ runEventLoop                                     agent/event.go:39
    }
 ```
 
-### processEvent（三阶段架构）
+### processEvent（五阶段架构）
 
 ```mermaid
 flowchart TD
-  PE["processEvent 三阶段<br/>event.go:81"] --> P1["Phase 1: PluginEngine.Dispatch(ev)<br/>event.go:83-89"]
+  PE["processEvent<br/>event.go:81"] --> P0["Phase 0: 消息幂等去重<br/>相同 message_id 丢弃 (WS 断线重连防重复)"]
+  P0 -->|重复| RET0["return"]
+  P0 -->|新消息| P05["Phase 0.5: 系统级群管理检测<br/>h.GroupMgr.Process (Go 原生)"]
+  P05 -->|consumed=true| RET05["return (刷屏/复读拦截)"]
+  P05 -->|未消费| P1["Phase 1: PluginEngine.Dispatch(ev)<br/>event.go:83-89"]
   P1 -->|consumed=true| RET1["return (插件拦截, 不入 Agent)"]
   P1 -->|ev = result.Event| P2["Phase 2: 仅 message 事件继续<br/>event.go:90-92"]
   P2 -->|PostType!=message 或 Message==nil| RET2["return"]
-  P2 --> P3["Phase 3: 回复策略检查<br/>event.go:94-103"]
+  P2 --> P3["Phase 3: 回复策略快速检查<br/>event.go:94-103"]
   P3 -->|skip_reply 标记| P3S["跳过检查"]
-  P3 -->|getReplySettings → checkReplyStrategyFast| RS{策略}
-  RS -->|never_reply| SKIP["skip"]
-  RS -->|at_only| AT["仅 isAtSelf 通过"]
-  RS -->|relevance| RL["延迟到 dispatchToAgent 后<br/>filterRelevant 批量判断"]
-  RS -->|always| OK["通过"]
+  P3 -->|checkReplyStrategyFast| RL["恒放行 (relevance 唯一策略)"]
   P3S --> D
-  AT --> D["dispatchToAgent(ctx, ev, rs)<br/>event.go:104"]
-  RL --> D
-  OK --> D
-  SKIP --> RET3["return"]
+  RL --> D["dispatchToAgent(ctx, ev, rs)<br/>event.go:104"]
   D --> G["goroutine + ConcurrencyManager.Acquire(chatAreaID)"]
   G --> HM["handleMessage(ctx, ev, chatArea, rs)"]
   HM --> R["ConcurrencyManager.Release(chatAreaID)"]
@@ -1573,14 +1714,14 @@ flowchart TD
 ```mermaid
 flowchart TD
   HM["handleMessage<br/>event.go:311"] --> M1["msg = 批次最后一条<br/>chatArea 缺失时 getChatArea<br/>event.go:315-324"]
-  M1 --> M2{"聊天黑名单?<br/>isAdmin \|\| ACL.CheckChat"}
-  M2 -->|命中| DROP["丢弃 (不进入 Agent, 不写回 tool msg)<br/>event.go:327-341"]
+  M1 --> M2["filterBlockedEvents 黑名单过滤<br/>命中聊天黑名单丢弃 (含 Admins, 不豁免)<br/>event.go:407-421"]
+  M2 -->|命中| DROP["丢弃 (不进入 Agent, 不写回 tool msg)"]
   M2 -->|未命中| M3["h.Session.GetOrCreate(chatArea.ID)<br/>event.go:344"]
   M3 --> M4["收集批内用户消息(带发言人标识) + Skills.Match<br/>event.go:351-380"]
   M4 --> M5["Loops.Register 活跃循环 (Web 监控页展示)<br/>event.go:388-397"]
-  M5 --> M6["longTermMems / skillMem 读取<br/>event.go:402-413"]
+  M5 --> M6["longTermMems / skillMem 读取<br/>长期记忆 RAG 语义召回首选,<br/>降级 pg_trgm gram → 最近条目<br/>event.go:402-413"]
   M6 --> M7["systemCtx = Prompt.BuildFullContext<br/>工具感知不拼入提示词 (Eino tools 参数)"]
-  M7 --> M8["buildKnowledgeContext: LRU/DB 模糊匹配, 命中拼入<br/>关键词命中 + ILIKE 兜底, 限 5 条, LRU 50 缓存<br/>event.go:415"]
+  M7 --> M8["buildKnowledgeContext: RAG 语义检索首选,<br/>降级关键词 + ILIKE 匹配, 限 5 条<br/>event.go:415"]
   M8 --> M9["buildStickerContext: 表情包标签 + 常用表情拼入指令"]
   M9 --> M10["einoMsgs 组装: system → sessionCtx → Skill: → 短期记忆 → user<br/>event.go:418-437"]
   M10 --> M11["AddShortTermMessage + Session.AppendRecord (Postgres 解耦)<br/>event.go:440-447"]
@@ -1715,36 +1856,37 @@ flowchart TD
 3. `<-webhookEvents`（仅 `WebhookAdapter != nil`）：调用 `processEvent`。
 4. `<-h.CronJobEvents`：合成 cronjob 事件，`Admins` 从 adapter 重新挂回后喂 `processEvent`。
 
-## 事件分发决策树（processEvent 三阶段）
+## 事件分发决策树（processEvent 五阶段）
 
-`processEvent`（`event.go:81-117`）采用三阶段架构：Plugin 拦截 → 消息过滤 → 回复策略检查 → 异步派发 Agent。
+`processEvent`（`event.go:81-174`）采用五阶段架构：幂等去重 → 群管理检测 → Plugin 拦截 → 消息过滤 → 回复策略检查 → 异步派发 Agent。
 
 ```mermaid
 flowchart TD
-  Start["processEvent(ev)"] --> P1["Phase 1: PluginEngine.Dispatch(ev)"]
+  Start["processEvent(ev)"] --> P0["Phase 0: 消息幂等去重"]
+  P0 -->|重复| D0["return"]
+  P0 -->|新消息| P05["Phase 0.5: 系统级群管理检测"]
+  P05 -->|consumed| D05["return (刷屏/复读)"]
+  P05 --> P1["Phase 1: PluginEngine.Dispatch(ev)"]
   P1 --> C1{"result.Consumed?"}
   C1 -->|是| Done["return (插件拦截)"]
   C1 -->|否| P2["Phase 2: 消息过滤"]
   P2 --> P2C{"PostType=='message'<br/>且 Message != nil?"}
   P2C -->|否| Drop["丢弃"]
-  P2C -->|是| P3["Phase 3: 回复策略检查"]
+  P2C -->|是| P3["Phase 3: 回复策略快速检查"]
   P3 --> P3C{"SkipReply 标记?"}
   P3C -->|是| DA["dispatchToAgent"]
-  P3C -->|否| STR{"ReplyStrategy?"}
-  STR --> never_reply["skip"]
-  STR --> at_only["仅 isAtSelf 通过"]
-  STR --> relevance["filterRelevant: 规则快路径 + 批量判断/缓存/降级"]
-  STR --> always["通过"]
-  at_only --> DA
-  relevance --> DA
-  always --> DA
+  P3C -->|否| STR["relevance（唯一策略）<br/>快速检查恒放行，LLM 判断延后"]
+  STR --> DA
   DA -->|goroutine| CM["ConcurrencyManager.Acquire"]
   CM --> HM["handleMessage"]
   HM --> CMR["ConcurrencyManager.Release"]
 ```
 
-> `isAtSelf`（`reply_strategy.go`）做的是精确 `[CQ:at,qq=<self>]` 匹配；优先用当前 `Adapter.SelfID()` 而非缓存 `SelfQQ`，支持机器人换号后立即生效。
-> relevance 判断优化管线（`filterRelevant` → `relevanceBatchEvaluate`）：@/命令/提及名字 → 必回（0 次 LLM）；噪音消息（纯表情/过短/仅 URL）→ 规则丢弃；其余候选合并为**一次** LLM 批量判断（含图消息标注 `[图片]`，单条候选走原分数判断）。判断结果写 Redis（related=15s 对话轮次放宽 / unrelated=30s 冷却），判断并发全局上限 4、超时可配置（reply_strategy 的 relevance_timeout，默认 10s），失败按 `judge_fail_policy`（drop/reply）降级；群聊刷屏（1s≥5 条）时批窗口拉长到 3s 并降级为只回必回消息。
+> **Phase 0（幂等去重）**：群/私聊的 `message_id` 各自独立递增，key 带 `message_type` 前缀；WS 断线重连/多连接时 OneBot 端重复推送的同一消息直接丢弃（`h.msgDedup.SeenBefore`）。
+>
+> **Phase 0.5（系统级群管理）**：`h.GroupMgr.Process`（Go 原生，先于所有 Lua 插件）。白名单/管理员/排除群豁免 → 违禁言论检测（RAG 语义核实首选，高置信直罚 / 模棱两可送 LLM / 低置信有词送 LLM / 无词放行；RAG 不可用降级关键词）；图片刷屏 / +1 复读 `consumed=true` 拦截不进 Agent。详见下方「群管理检测闸门」章节。
+>
+> `checkReplyStrategyFast` 恒放行：回复策略已收敛为仅 `relevance`（@/命令/提及名字必回由规则快路径保证），LLM 相关性判断延后到 `dispatchToAgent` 的 goroutine 内由 `filterRelevant` 执行（`filterRelevant` → `relevanceBatchEvaluate`）：@/命令/提及名字 → 必回（0 次 LLM）；噪音消息（纯表情/过短/仅 URL）→ 规则丢弃；其余候选合并为**一次** LLM 批量判断（含图消息标注 `[图片]`，单条候选走原分数判断）。判断结果写 Redis（related=15s 对话轮次放宽 / unrelated=30s 冷却），判断并发全局上限 4、超时可配置（relevance_timeout，默认 10s），失败按 `judge_fail_policy`（drop/reply）降级；群聊刷屏（1s≥5 条）时批窗口拉长到 3s 并降级为只回必回消息。
 
 ## 一条消息的全程（OneBot11 → 回执）
 
@@ -1754,7 +1896,7 @@ sequenceDiagram
   participant OB as OneBot11 实现
   participant AD as Adapter (反向 WS)
   participant EL as runEventLoop
-  participant PE as processEvent (三阶段)
+  participant PE as processEvent (五阶段)
   participant CM as ConcurrencyManager
   participant HM as handleMessage
   participant EA as Eino ADK Agent
@@ -1765,16 +1907,19 @@ sequenceDiagram
   AD->>AD: readLoop/parseEvent → events
   AD->>EL: Adapter.Events()
   EL->>PE: processEvent
+  PE->>PE: Phase 0: 消息幂等去重
+  PE->>PE: Phase 0.5: 群管理检测（刷屏/复读拦截，违禁内部处罚）
   PE->>PE: Phase 1: Plugin.Dispatch
   PE->>PE: Phase 2: 消息过滤
-  PE->>PE: Phase 3: 回复策略检查
+  PE->>PE: Phase 3: 回复策略快速检查（relevance 恒放行）
   PE->>CM: dispatchToAgent (goroutine)
   CM->>CM: Acquire(chatAreaID)
   CM->>HM: handleMessage
   HM->>HM: GetOrCreate ChatArea/Session
-  HM->>HM: ACL.CheckChat (admin 跳过)
-  HM->>HM: Skills.Match + Memory + SkillMemory
+  HM->>HM: filterBlockedEvents 黑名单过滤 (管理员不豁免)
+  HM->>HM: Skills.Match + Memory + SkillMemory<br/>(长期记忆 RAG 语义召回)
   HM->>HM: Prompt.BuildFullContext<br/>(SystemLocked + 长期记忆 + skillMemory)<br/>工具感知交由 Eino tools 参数
+  HM->>HM: buildKnowledgeContext (RAG 语义检索首选)
   HM->>HM: AddShortTermMessage(Redis) + AppendRecord(Postgres)
   HM->>EA: EinoAgent.Run (ReAct 循环, MaxIterations=20)
   EA->>EA: LLM.Chat → 工具调用(同步) → 循环
@@ -1784,6 +1929,32 @@ sequenceDiagram
   CM->>CM: Release(chatAreaID)
   QQ-->>U: QQ 消息回执
 ```
+
+## 群管理检测闸门（Phase 0.5，系统级）
+
+`internal/agent/groupmgr` 是与定时任务/摸鱼人日历同级的系统功能，替代旧 Lua 插件 `redrock_group_manager`。检测闸门位于 Phase 0（幂等去重）之后、Phase 1（Lua 插件派发）之前，**系统级优先于所有插件**，避免与插件双重检测/重复处罚。
+
+```mermaid
+flowchart TD
+  MSG["群聊消息"] --> EX["豁免检查: 白名单 / 管理员 / 排除群"]
+  EX -->|豁免| RET["放行（不进检测）"]
+  EX --> CARD["推荐卡片文本化（不再直罚）"]
+  CARD --> RAG["RAG 语义核实（第一核实人, 三档阈值）"]
+  RAG -->|score ≥ high_score| PUNISH["直接处罚（无词命中同样直罚）"]
+  RAG -->|low < score < high| LLM["LLM 审核（异常按 fallback_score 分数兜底）"]
+  RAG -->|score ≤ low| LOW["低置信"]
+  LOW -->|有词/卡片命中| LLM
+  LOW -->|无硬信号| PASS["放行"]
+  RAG -.RAG 不可用.| KW["降级关键词路径（= 旧插件行为）"]
+  LLM -->|判定违规| PUNISH
+  PUNISH --> LEARN["学习闭环: 样本入库 + RAG Upsert（越用越准）"]
+```
+
+- 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
+- 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
+- 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）
+- Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
+- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步
 
 ## CronJob 注入流
 
@@ -2040,12 +2211,13 @@ Lua 侧通过 SDK `jn.command.register(path, handlerFn, opts)` 注册，path 可
 |--------|------|------|
 | `log` | 始终 | info/warn/error → slog `[plugin:<name>]` 前缀 |
 | `json` | 始终 | encode/decode |
-| `onebot11` | `onebot11` | 21 个 OneBot11 API（SendAdapter 接口桥接） |
-| `http` | `http` | get/post，30s 超时真实 HTTP |
+| `onebot11` | `onebot11` | OneBot11 API（发送/群管理/请求处理/合并转发/引用回复等） |
+| `http` | `http` | get/post + 异步，30s 超时真实 HTTP（可选 http/socks4/socks5 代理） |
 | `database` | `database` | query/exec（共享 DB；`prefixSQL` 桩未生效，⚠ 任意 SQL） |
 | `cache` | `cache` | get/set/del/exists（`pluggin:<name>:` 前缀命名空间） |
 | `t2i` | `t2i` | generate / generate_url + toggle/is_active/get_config |
 | `sandbox` | `sandbox` | create/exec_shell/exec_python/list/delete + toggle/is_active/get_config |
+| `rag` | `rag` | add/add_async/search/search_async（对接 RAG-Service） |
 | `agent` | `agent` | 配置查询 + Provider/MCP/Tool 切换 + switch_provider + compact_memory |
 | `jn.command` | 内置 | 命令注册 |
 
@@ -2114,7 +2286,10 @@ local id, err = jn.t2i.generate("<h1>Hello</h1>")
 | 改前端页面 | `web/src/views/*.vue`（28 页）、`web/src/api/*`（typed endpoints）、`web/src/router/index.ts` |
 | 改 Plugin SDK | `internal/pluggin/sdk/jn.lua`（`//go:embed`，带 LuaCATS 注解） |
 | 加数据模型 | `internal/core/models/` 加 GORM model + `core.go::AutoMigrate` 注册 + `internal/core/dao/` DAO + `dao.NewBundle` 接入 |
-| 加知识库内容/调匹配策略 | `internal/core/dao/knowledgeDao.go::Match`（关键词+ILIKE 匹配）；`internal/agent/knowledge.go`（LRU/异步提取/注入） |
+| 加知识库内容/调匹配策略 | `internal/core/dao/knowledgeDao.go::Match`（关键词+ILIKE）；`internal/agent/knowledge.go`（LRU/异步提取/注入）；RAG 语义检索入口 `internal/agent/rag.go` + `internal/core/ragtag`（tag 派生） |
+| 接 RAG 向量检索 | `infrastructure/rag/`（客户端）+ `internal/core/dao/ragDao.go`（配置）+ `internal/agent/rag.go`（知识/记忆召回编排）；服务本体在 [JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service) |
+| 改群管理检测 | `internal/agent/groupmgr/`（检测器/惩罚/LLM 审核/RAG 核实）+ `internal/core/dao/groupmgrDao.go` + `internal/api/service/groupmgr.go` + 前端 `web/src/views/GroupMgrPage.vue` |
+| 加 Prometheus 指标 | `internal/metrics/`（指标定义/挂点/HTTP 中间件），事件/Agent/LLM/群管理等埋点在 `internal/agent/event.go`、`agent.go`、`groupmgr/` |
 | 改图床（存储/API/引用解析） | `internal/core/imgstore/`（文件存储）+ `internal/core/dao/imageDao.go`（元数据）+ `internal/api/service/service.go`（上传/校验）+ `internal/adapter/api.go::resolveImageAssets`（imgs:// 解析） |
 | 改表情包库 | `internal/core/dao/stickerDao.go` + `internal/agent/sticker.go`（Agent 工具）+ `internal/pluggin/pluggin.go::injectOneBot11`（send_*_sticker） |
 | 改摸鱼人日历 | `internal/agent/fishcal/fishcal.go`（独立调度器/模板/农历/节假日）+ `internal/core/dao/fishCalDao.go`（配置+按天群务） |
@@ -2129,9 +2304,12 @@ internal/
   agent/        Agent 核心 — Eino ADK (adk.ChatModelAgent + adk.Runner + ConcurrencyManager)
     provider/   OpenAI 兼容客户端 (Chat / Vision + Eino model adapter)
     mcp/        MCP 客户端 (mark3labs/mcp-go SSE)
-    memory/     记忆子系统: shortterm(Redis 滑窗 100 条 + AutoCompact) / longterm(PG+HotArea) / skillmem(技能记忆)
+    memory/     记忆子系统: shortterm(Redis 滑窗 100 条 + AutoCompact) / longterm(RAG 语义召回→pg_trgm→最近) / skillmem(技能记忆)
+    groupmgr/   群管理（系统级, Phase 0.5 闸门）— RAG 核实/LLM 审核/三级惩罚/刷屏复读/词库样本
+    rag.go      知识/记忆 RAG 语义检索编排 + 降级
     prompt/     系统锁定提示词 + 拼接
     session/    会话 + ChatRecord 持久化
+  metrics/      Prometheus 指标（/metrics 端点 + 运行时 Collector + 全模块挂点）
     skill/      关键词/正则技能匹配
     tool/       ToolRegistry + 内置工具 + Eino InvokableTool 适配 (BuildEinoTools)
     cronjob/    robfig/cron 调度器 (on_cronjob 事件注入)
@@ -2141,10 +2319,10 @@ internal/
     agent_operator.go   插件 Agent 操作 (SetProviderActive/SwitchProvider/SetMCPActive/SetToolActive/CompactMemory…)
     concurrency.go      每 ChatArea 并发控制 (默认 8 goroutine)
     eino_middleware.go  Eino ADK 中间件 (BeforeAgent 动态指令注入 / AgentLite 工具过滤 / WrapInvokableToolCall 同步执行包装)
-    event.go            三阶段事件循环 (Plugin.Dispatch → ReplyStrategy → dispatchToAgent)
-    reply_strategy.go   回复策略 (NeverReply/AtOnly/Always/Relevance)
+    event.go            五阶段事件循环 (去重 → 群管理 → Plugin.Dispatch → ReplyStrategy → dispatchToAgent)
+    reply_strategy.go   回复策略 (仅 Relevance 按相关性回复)
   api/          Hertz Web (engine + middleware + router + service)
-  core/         Init / dao.Bundle / models (31 表) / acl / cache / imgstore(图床文件存储)
+  core/         Init / dao.Bundle / models (39 表) / acl / cache / imgstore(图床文件存储)
   pluggin/      Lua 引擎 + 命令树 + 内嵌 SDK + 系统插件
   web/          SPAHandler (NoRoute 兜底)
   logging/      fatih/color 彩色 stdout + JSON 格式化 + 调用栈 + Hub(SSE)
@@ -2162,12 +2340,12 @@ docs/                   本文档树
 | 项 | 状态 |
 |----|------|
 | Adapter 反向 WS / Webhook / API | ✅ 完整实现 |
-| EventLoop / processEvent 三阶段 (Plugin.Dispatch → ReplyStrategy → dispatchToAgent) | ✅ |
+| EventLoop / processEvent 五阶段 (去重 → 群管理 → Plugin.Dispatch → ReplyStrategy → dispatchToAgent) | ✅ |
 | Eino ADK Agent (adk.ChatModelAgent + adk.Runner + ConcurrencyManager) | ✅ |
 | CronJobManager (robfig/cron + on_cronjob 回调) | ✅ |
 | Provider (OpenAI 兼容 + 流式 + Vision) | ✅ |
 | MCP (SSE) | ✅ |
-| Memory (shortterm Redis 100 条滑窗 + AutoCompact / longterm PG+HotArea / skillmem) | ✅ |
+| Memory (shortterm Redis 100 条滑窗 + AutoCompact / longterm RAG 语义召回→pg_trgm→最近 / skillmem) | ✅ |
 | Prompt (SystemLocked + BuildFullContext，工具感知走 Eino tools 参数不拼入提示词) | ✅ |
 | ToolRegistry + 内置工具 | ✅（除 `vision` builtin 只返回提示，真 Vision 走 reply_strategy.go）|
 | Lua 插件引擎 + 命令树 + 系统 SDK + 系统插件 | ✅ |
@@ -2205,7 +2383,7 @@ docs/                   本文档树
 
 ## 数据模型与持久化策略
 
-- Postgres 拥有**所有**持久状态（23 张表，见 `internal/core/core.go::AutoMigrate`）
+- Postgres 拥有**所有**持久状态（39 张表，见 `internal/core/core.go::AutoMigrate`）
 - Redis 仅作：短期记忆滑动窗口（`shortterm:msgs:<areaID>` List）、PubSub 任务结果通知、插件/Agent 任意缓存
 - `ChatRecord.id` 为自增 int64（不是 UUID，多数表用 UUID），保留这个差异
 - 单行配置表（`Onebot11Adapter`/`WebhookConfig`/`T2IConfig`/`SandboxConfig`）固定 `id=1`，首次 `InitConfig` 用 `OnConflict DoNothing` 建默认行
@@ -2272,7 +2450,7 @@ DTO 转换集中在 `dto/transfer.go`，枚举预定义在 `dto/response.go`。
 
 ## 外部服务接入细节
 
-本文档集中说明 JuanNiang-Neo 如何接入外部服务：LLM Provider、MCP、Postgres、Redis、T2I、Sandbox。每节给出：包路径、客户端构造方式、运行时热更新机制、可配置项与启停语义，以及与 HagoCenter / Service 插件的关系。
+本文档集中说明 JuanNiang-Neo 如何接入外部服务：LLM Provider、MCP、Postgres、Redis、T2I、Sandbox、RAG。每节给出：包路径、客户端构造方式、运行时热更新机制、可配置项与启停语义，以及与 HagoCenter / Service 插件的关系。
 
 ## 总览
 
@@ -2284,8 +2462,9 @@ DTO 转换集中在 `dto/transfer.go`，枚举预定义在 `dto/response.go`。
 | Redis | `infrastructure/redis/` | `redis.NewClient` | env (`REDIS_*`) | 无 |
 | T2I | `infrastructure/t2i/` + `/handler` | `t2i.NewClient` (含 HealthCheck) | Postgres `t2i_configs` 单行 | API toggle 重建 `*Client` |
 | Sandbox | `infrastructure/sandbox/` + `/handler` | `sandbox.NewClient` (含 HealthCheck) | Postgres `sandbox_configs` 单行 | API toggle 重建 `*Client` |
+| RAG | `infrastructure/rag/` + `/handler` | `rag.NewClient` (含 HealthCheck) | Postgres `rag_configs` 单行 | API toggle 置 nil/重建 |
 
-所有持久化在 Postgres + Redis（短期记忆窗口、PubSub、任意缓存）。`.env` 中的 `T2I_BASE_URL`/`SANDBOX_*` 仅是文档性 env，**运行时实际从 DB 读取**。
+所有持久化在 Postgres + Redis（短期记忆窗口、PubSub、任意缓存）。`.env` 中的 `T2I_BASE_URL`/`SANDBOX_*` 仅是文档性 env，**运行时实际从 DB 读取**（RAG 同理，无 env）。
 
 ## LLM Provider
 
@@ -2357,7 +2536,7 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 ### Schema
 
-`core.Init` 调用 `AutoMigrate` 创建 23 张表。**不读 `sql/init.sql`**（仅文档参考）。GORM AutoMigrate 按列追加/索引同步，**不会删列**，开发期字段删除需手工 `ALTER TABLE`。
+`core.Init` 调用 `AutoMigrate` 创建 39 张表。**不读 `sql/init.sql`**（仅文档参考）。GORM AutoMigrate 按列追加/索引同步，**不会删列**，开发期字段删除需手工 `ALTER TABLE`。
 
 ## Redis
 
@@ -2439,6 +2618,42 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 2. Web 面板"Sandbox"页填 `base_url`、`api_key`、`timeout`、勾"启用"
 3. Agent 内置工具 `command_exec`/`code_exec`/`browser_search`/`create_sandbox`/`list_sandboxes` 与 MCP 工具一样在 Eino ReAct 循环内**同步执行**（无后台调度管道；`IsLongRunning` 仅作元数据标记，不影响执行方式）。Lua 插件 `sandbox.create/exec_shell/exec_python/list/delete`（同步）；耗时执行建议用 `create_async/exec_shell_async/exec_python_async`（异步，完成回调 `on_sandbox_response`，不阻塞事件循环）
 
+## RAG
+
+> RAG 向量检索服务：独立部署的 Rust 进程，bge 模型进程内推理（零外部依赖），提供文本向量化 / 语义检索 / 自动分块。仓库：[JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service)，API 详见其 `docs/API.md`。
+
+### 客户端
+
+- 包 `infrastructure/rag`（构造 `*handler.Client`），`NewClient(opts...)` 强制 `HealthCheck()` 通过才返回成功
+- 选项：`WithBaseURL`、`WithTimeout`（**无 APIKey** — RAG 不鉴权）
+- `handler` 子包（package `caller`）真正 `Client`：`Config{BaseURL, Timeout}` + `HttpClient`
+  - `HealthCheck` `GET /health`、`Info` `GET /info`（模型状态/进程内存/向量规模）
+  - `Upsert(tag, text)` `PUT /tags/{tag}`（幂等，长文服务端自动分块）、`BatchUpsert` `POST /tags/batch`（批量，一次嵌入推理）
+  - `Search(q, k, minScore)` `GET /tags/search`（按相似度返回 `[{tag, score}]`，自动加 bge 官方指令前缀）、`Delete(tag)` `DELETE /tags/{tag}`
+- **tag 契约**：Agent 侧保管原始文档与 UUID；本服务只做向量化/检索/删除。`tag` 必须为 UUID 字符串
+
+### 运行时
+
+- 启动时 `loadRAGFromDB`（`cmd/server/main.go`）读 `rag_configs` 单行（**默认未启用**）；`Service.OnUpdateRAG` 回调：每次 `PUT /rag/config` 用最新配置重建 `*Client` 并注入 `HagoCenter`，停用/失败置 nil（= 降级开关）
+- 客户端经 `agentOp.GetRAGClient()`（`pluggin.AgentOperator`）供插件动态获取，热更新即时生效
+- **tag 隔离**：知识/记忆/群管理词条·样本共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（`internal/core/ragtag`：`k:`/`m:`/`w:`/`s:`），互不污染
+
+### 降级语义（任何 RAG 故障都不影响主流程）
+
+| 调用方 | 首选 | 降级 |
+|--------|------|------|
+| 知识库检索 | RAG 语义检索（命中按分数注入 ≤5 条） | SQL 关键词 + ILIKE 匹配（接入前行为） |
+| 长期记忆召回 | RAG 向量语义 | pg_trgm gram 候选 → 最近条目（三级降级链） |
+| 群管理违禁检测 | RAG 语义核实（三档阈值） | 关键词路径（= 旧插件行为） |
+| 群管理词条/样本写入 | RAG 可用时同步 Upsert | 未配置静默跳过、失败仅告警 |
+
+### 接入指南
+
+1. 部署 [JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service)：`make download && cargo run --release`（默认监听 `127.0.0.1:3000`，可用 `RAG_PORT` 等环境变量覆盖）
+2. Web 面板"RAG 向量"页填 `base_url`（如 `http://localhost:3000`）、`timeout`，勾"启用"
+3. 知识库 / 群管理 / 记忆页面有「同步向量库」按钮手动全量同步；新增/编辑/删除自动双写双删
+4. 插件可用 `jn.rag`（权限 `rag`）直连原始 RAG-Service（见 [插件 API 参考](../plugins/api-reference.md#全局表-rag)）
+
 ## 一致性：HagoCenter 与 Service 共享同指针
 
 T2I 与 Sandbox 的客户端**热更新关键**在于 `HagoCenter` 与 `Service` **共享同一个 `*Client` 指针**：
@@ -2456,12 +2671,13 @@ T2I 与 Sandbox 的客户端**热更新关键**在于 `HagoCenter` 与 `Service`
 - Web API：JWT（`JWT_SECRET`）
 - Sandbox：`APIKey`（Bearer）
 - T2I：无鉴权
+- RAG：无鉴权（内网部署）
 - Admins 列表（OneBot11 绕 ACL）：来自 `Onebot11Adapter.AdminQQNumbers`（DB，可热增删），每条 `Event` 都透传 `Admins []string`
 
 ## 健康检查约定
 
-- T2I / Sandbox 的 `NewClient` 在构造时就执行 `HealthCheck()`，慢启动——不健康直接返回 err（视情况选择是否启用）
-- 进程启动后 `GET /api/v1/t2i/health`、`GET /api/v1/sandbox/health` 可再探活；`GET /api/v1/overview` 返回 `t2i_healthy`/`sandbox_healthy`
+- T2I / Sandbox / RAG 的 `NewClient` 在构造时就执行 `HealthCheck()`，慢启动——不健康直接返回 err（视情况选择是否启用）
+- 进程启动后 `GET /api/v1/t2i/health`、`GET /api/v1/sandbox/health`、`GET /api/v1/rag/health` 可再探活；`GET /api/v1/rag/info` 返回模型/内存/向量规模；`GET /api/v1/overview` 返回 `t2i_healthy`/`sandbox_healthy`/`rag_active`/`rag_healthy`
 - Postgres / Redis 无端点级健康接口，但 `core.Init` 要求都能连接成功；`docker compose` 给 PG/Redis 配了 healthcheck
 
 ---
@@ -4800,21 +5016,24 @@ git reset --hard <commit-hash>
 
 ***JuanNiang-Neo 是一个以 Go 1.25 构建的 QQ 机器人项目，红岩网校的吉祥物卷娘。***
 
-核心由 LLM 驱动的对话 Agent（`HagoCenter` 聚合 Provider / MCP / Memory / Prompt / Session / Skill / Tool）与 OneBot11 反向 WebSocket 适配器组成，基于 [Eino ADK](https://github.com/cloudwego/eino) 框架构建 `ChatModelAgent`，工具调用在 ReAct 循环内同步执行，每个聊天区域最多 8 个 Agent goroutine 并发处理（由 `ConcurrencyManager` 控制）。事件流经三阶段管线：Plugin 拦截 → 回复策略检查 → 异步派发 Agent。项目同时包含 Lua 插件引擎、Vue 3 管理面板，以及 Postgres + Redis + Sandbox + T2I 等可插拔基础设施，并内置知识库、图床、表情包库、摸鱼人日历、定时消息（积木式编排）等开箱即用的功能模块。所有持久化状态落 Postgres + Redis，配置与运行时状态均可在 Web 面板热切换。
+核心由 LLM 驱动的对话 Agent（`HagoCenter` 聚合 Provider / MCP / Memory / Prompt / Session / Skill / Tool）与 OneBot11 反向 WebSocket 适配器组成，基于 [Eino ADK](https://github.com/cloudwego/eino) 框架构建 `ChatModelAgent`，工具调用在 ReAct 循环内同步执行，每个聊天区域最多 8 个 Agent goroutine 并发处理（由 `ConcurrencyManager` 控制）。事件流经五阶段管线：幂等去重 → 系统级群管理检测 → Plugin 拦截 → 消息过滤 → 回复策略 → 异步派发 Agent。项目同时包含 Lua 插件引擎、Vue 3 管理面板，以及 Postgres + Redis + Sandbox + T2I + RAG 等可插拔基础设施，并内置知识库、图床、表情包库、摸鱼人日历、定时消息（积木式编排）、群管理系统功能等开箱即用的功能模块。所有持久化状态落 Postgres + Redis，配置与运行时状态均可在 Web 面板热切换。
 
 ## 主要特性
 
 - **Agent 系统**：基于 Eino ADK 的 `ChatModelAgent`（OpenAI 兼容），支持 Provider / MCP / Tool / Skill / Prompt / Plugin 多模块组合，工具调用在 ReAct 循环内同步完成
-- **异步并发处理**：`ConcurrencyManager` 控制每 ChatArea 最多 8 个 Agent goroutine 并发，事件经三阶段管线（Plugin 拦截 → 回复策略 → Agent 派发）高效分流
-- **相关性回复优化**：`relevance` 策略下 @/命令/提及名字必回、噪音消息规则过滤、候选消息批量合并为一次 LLM 判断，带 Redis 结果缓存/冷却、并发限流与刷屏自动降级，热聊场景判断开销降至原来的 ~1/10
-- **四层记忆体系**：短期记忆（Redis 滑动窗口，默认 100 条，自动 Compact）/ 长期记忆（Postgres + 内存 LRU）/ 技能记忆（SkillMemory，Compact 时自动提取）/ 会话记录（Postgres 审计）
+- **异步并发处理**：`ConcurrencyManager` 控制每 ChatArea 最多 8 个 Agent goroutine 并发，事件经五阶段管线（去重 → 群管理 → Plugin 拦截 → 过滤 → 回复策略 → Agent 派发）高效分流
+- **相关性回复优化**：回复策略收敛为仅 `relevance`——@/命令/提及名字必回、噪音消息规则过滤、候选消息批量合并为一次 LLM 判断，带 Redis 结果缓存/冷却、并发限流与刷屏自动降级，热聊场景判断开销降至原来的 ~1/10
+- **四层记忆体系**：短期记忆（Redis 滑动窗口，默认 100 条，自动 Compact）/ 长期记忆（Postgres + RAG 语义召回，降级 pg_trgm 相似度匹配）/ 技能记忆（SkillMemory，Compact 时自动提取）/ 会话记录（Postgres 审计）
+- **RAG 语义检索**：对接独立 RAG-Service（bge 进程内推理），知识库检索、长期记忆召回、群管理违禁核实均以 RAG 语义匹配为**首选**，未配置/故障自动降级不阻塞主流程
 - **OneBot11 反向 WebSocket 适配器**：与 QQ 机器人框架对接，OneBot11 API 作为 Agent 工具注册
 - **Lua 插件系统**：gopher-lua 驱动，支持多级命令、Lua SDK（带 LuaCATS 注解）、插件目录文本文件读写（`jn.file`）、系统插件保护
 - **插件商店**：从 GitHub 仓库浏览/安装社区插件（统一 5 件套格式），国内镜像源手动选择 + 连通性测试，每晚自动更新元数据；插件动态配置（bool/string/list）由 Web 面板按 `config.yaml` 动态渲染
 - **Web 管理后台**：Vue 3 + Vuetify 3，JWT 鉴权（可选 OIDC SSO），管理全部配置与运行时状态
 - **基础设施**：Postgres 持久化 + Redis 缓存 + Sandbox 代码沙箱 + T2I 文生图，未配置时自动返回未启用提示
 - **彩色日志系统**：基于 `fatih/color` 的自定义日志，彩色输出、JSON 自动格式化、WARN+ 调用栈、模块日志器、GORM SQL 日志集成
-- **SQL 驱动知识库**：Web 存知识 → Agent 异步提取关键词 → 对话前模糊匹配注入提示词；50 条 LRU 加速检索
+- **SQL 驱动知识库**：Web 存知识 → Agent 异步提取关键词 → 对话前 RAG 语义检索（首选）+ 关键词/模糊匹配降级，命中注入提示词
+- **群管理系统功能**：Go 原生（替代旧 Lua 插件），违禁言论 RAG 语义核实 + LLM 审核 + 学习闭环、图片刷屏/复读检测、三级惩罚、白名单/管理员豁免、`/groupstats` 等系统命令，Web 面板全参数可配
+- **Prometheus 监控**：`GET /metrics` 暴露事件流/Agent/LLM/群管理/RAG/插件/HTTP 等十组指标 + Go runtime，可配 Grafana 面板
 - **图床服务**：`data/imgs` 存储 + MIME/大小校验 + 虚拟文件夹；`imgs://<ID>` 引用由发送层自动转 base64（Plugin / Agent 无感）
 - **表情包库**：图床二次封装（名称/简介/标签）；短 UUID 对外，`stk://` 引用自动映射图床长 UUID（表情段 subType=1）；Agent 工具 + Plugin API 齐备
 - **摸鱼人日历**：独立每日定时任务，模板 → T2I 渲染 800×720 黑白纸张质感图片 → 富文本发送（不 @全体成员）；多群、按天群务、一言金句、农历/法定假日倒计时
@@ -4831,7 +5050,7 @@ git reset --hard <commit-hash>
 | Web 框架 | Hertz（Go）+ Vite 6 + Vuetify 3（前端） |
 | 存储 | PostgreSQL（持久化）+ Redis（缓存 / 短期记忆 / PubSub） |
 | 协议 | OneBot11 反向 WebSocket |
-| 基础设施 | Sandbox 代码沙箱、T2I 文生图（可插拔，未配置自动降级） |
+| 基础设施 | Sandbox 代码沙箱、T2I 文生图、RAG 向量检索（可插拔，未配置自动降级） |
 
 ## 相关仓库
 
@@ -4839,6 +5058,7 @@ git reset --hard <commit-hash>
 |------|------|
 | [JuanNiang-Neo](https://github.com/JuanNiangDev/JuanNiang-Neo) | 主项目：机器人本体 + Web 管理面板（Go + Vue） |
 | [JuanNiang-Plugins](https://github.com/JuanNiangDev/JuanNiang-Plugins) | 官方插件仓库：插件源码 + 商店元数据 + `hago` 脚手架 CLI |
+| [JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service) | RAG 向量检索服务（Rust + bge，独立部署） |
 
 ## 从哪开始？
 
@@ -4847,7 +5067,7 @@ git reset --hard <commit-hash>
 想**改主项目代码** → [本地开发环境](development/setup.md) 与 [开发指南](development/development.md)
 - 想**给卷娘写插件** → [插件开发指南](plugins/quickstart.md)
 
-> 详细架构（Eino ADK Agent / 三阶段事件循环 / 数据模型 / 插件系统）见 [架构与设计](development/architecture.md)。
+> 详细架构（Eino ADK Agent / 五阶段事件循环 / 数据模型 / 插件系统）见 [架构与设计](development/architecture.md)。
 
 ---
 
@@ -6278,14 +6498,18 @@ jn.file.append_line("data/log.txt", "事件发生于 " .. os.date())
 
 | 函数 | 说明 |
 |------|------|
-| `onebot11.send_private_msg(user_id, message) → bool, string` | **异步发送**私聊，立即返回。`message` 可为 string 或消息段数组 |
-| `onebot11.send_group_msg(group_id, message) → bool, string` | **异步发送**群聊，立即返回 |
-| `onebot11.send_private_msg_sync(user_id, message) → bool [, err]` | **同步发送**私聊，阻塞等待结果返回 |
-| `onebot11.send_group_msg_sync(group_id, message) → bool [, err]` | **同步发送**群聊，阻塞等待结果返回 |
+| `onebot11.send_private_msg(user_id, message [, reply_to]) → bool, string` | **异步发送**私聊，立即返回。`message` 可为 string 或消息段数组；`reply_to` 为被引用消息 ID（可选），自动在消息前插入引用段 |
+| `onebot11.send_group_msg(group_id, message [, reply_to]) → bool, string` | **异步发送**群聊，立即返回 |
+| `onebot11.send_private_msg_sync(user_id, message [, reply_to]) → bool [, err]` | **同步发送**私聊，阻塞等待结果返回 |
+| `onebot11.send_group_msg_sync(group_id, message [, reply_to]) → bool [, err]` | **同步发送**群聊，阻塞等待结果返回 |
+| `onebot11.send_group_forward_msg(group_id, nodes) → bool, string` | **异步发送群合并转发**（转发卡片），立即返回；`nodes` 为节点数组（见下） |
+| `onebot11.send_group_forward_msg_sync(group_id, nodes) → number [, err]` | **同步发送群合并转发**，返回 `message_id` |
 | `onebot11.delete_msg(message_id) → bool [, err]` | 撤回消息；`message_id` 接受数字或字符串（事件表的 `message_id` 为字符串，避免 QQ 长 ID 精度丢失） |
 | `onebot11.read_file_base64(path) → string, err` | 从插件目录读取文件并返回 `base64://...` 字符串 |
 
 > **异步 vs 同步**：默认 `send_xxx_msg` 为异步（fire-and-forget），适合大多数场景。需要确认发送结果或获取 `message_id` 时用 `send_xxx_msg_sync`。
+>
+> **引用回复（reply_to）**：`reply_to` 传群/会话内已有消息 ID 即可在发送时自动带出引用卡片；字符串含 CQ 码时先解析为段数组再前插 `reply` 段，参数非法时忽略引用并告警，对存量插件完全兼容。
 
 #### 消息段格式（富文本）
 
@@ -6309,6 +6533,26 @@ jn.onebot11.send_group_msg(123456, {
 - `http://` / `https://` → 直接透传 URL
 - `base64://` → 直接透传
 - 相对路径（如 `img/photo.png`）→ 从插件目录自动读取并转 base64
+
+#### 合并转发节点格式（`send_group_forward_msg`）
+
+`nodes` 为节点数组，两种节点：
+
+| 节点类型 | 字段 | 说明 |
+|----------|------|------|
+| 构造节点 | `user_id`（number）、`nickname`（string）、`content`（string 或消息段数组） | 自定义发送者与内容（content 自动解析 CQ 码与图床引用） |
+| 引用节点 | `id`（number） | 直接引用群内已有消息 ID |
+
+```lua
+jn.onebot11.send_group_forward_msg(123456, {
+    { user_id = 10001, nickname = "张三", content = "第一条内容" },
+    { user_id = 10002, nickname = "李四", content = {
+        { type = "text", data = { text = "富文本：" } },
+        { type = "image", data = { file = "img/cat.png" } },
+    } },
+    { id = 987654 },
+})
+```
 
 ### 群信息查询
 
@@ -6359,10 +6603,20 @@ local info, err = jn.onebot11.get_group_info(987654321)
 
 | 函数 | 返回 | 说明 |
 |------|------|------|
-| `http.get(url) → table` | `{status=number, body=string}` | GET，30s 超时 |
-| `http.post(url [, content_type, body]) → table` | `{status, body}` | POST，30s 超时 |
-| `http.get_async(url [, ctx]) → number` | `req_id` | GET 异步版：立即返回，完成回调 `on_http_response`（不阻塞事件循环） |
-| `http.post_async(url [, content_type, body, ctx]) → number` | `req_id` | POST 异步版 |
+| `http.get(url [, proxy]) → table` | `{status=number, body=string}` | GET，30s 超时；`proxy` 可选（见下） |
+| `http.post(url [, content_type, body, proxy]) → table` | `{status, body}` | POST，30s 超时 |
+| `http.get_async(url [, ctx, headers, proxy]) → number` | `req_id` | GET 异步版：立即返回，完成回调 `on_http_response`（不阻塞事件循环）；可选第 3 位 `headers` 表（`{ ["User-Agent"]="...", ["Referer"]="..." }`）用于反爬/风控站点（如微信公众号）；第 4 位 `proxy` 字符串；也可传第 2 位 opts 表 `{proxy=…, headers=…, ctx=…}` |
+| `http.post_async(url [, content_type, body, proxy, ctx]) → number` | `req_id` | POST 异步版；第 4 位为 `proxy` 字符串时 `ctx` 后移至第 5 位 |
+
+**可选代理 `proxy`**（http/socks4/socks5，向后兼容——不传即直连）：
+
+| 格式 | 协议 |
+|------|------|
+| `http://host:port` / `https://host:port` | 标准 HTTP 代理 |
+| `socks5://[user:pass@]host:port` | SOCKS5（支持用户名密码） |
+| `socks4://host:port` / `socks4a://host:port` | SOCKS4（域名目标自动走 SOCKS4a） |
+
+非法协议返回明确错误；按代理地址缓存 `http.Client` 复用连接池，socks 拨号时自动清空环境 HTTP 代理避免双代理冲突。
 
 ```lua
 local r, err = jn.http.get("https://api.github.com/repos/x/y")
@@ -6492,6 +6746,37 @@ function on_sandbox_response(req_id, ctx, result, err)
 end
 ```
 
+## 全局表: `rag`
+
+权限：`rag`。RAG 向量检索（对接独立的 JuanNiang-RAG-Service，bge 模型进程内推理）。**未启用/服务不可达时** `add`/`search` 返回 `(nil, ...)` 错误，不阻塞主流程。
+
+> **tag 契约**：`rag.*` 面向**原始 RAG-Service**——`tag` 必须是 UUID 字符串，全文入库自动分块。不要与主程序知识/记忆/群管理词条内部使用的派生 tag（`k:`/`m:`/`w:`/`s:` 前缀的 UUID v5）混用。
+
+| 函数 | 返回 | 说明 |
+|------|------|------|
+| `rag.add(tag, text) → bool [, err]` | bool | 同步写入（幂等 upsert，长文自动分块） |
+| `rag.add_async(tag, text [, ctx]) → number` | `req_id` | 异步写入，立即返回；完成回调 `on_rag_response`（不阻塞事件循环） |
+| `rag.search(query [, k, min_score]) → RAGHit[] [, err]` | `[{tag, score}]` | 同步检索，按分数降序；`k` 默认 10（1~100），`min_score` 为相似度下限（0~1，建议从 0.5 起步） |
+| `rag.search_async(query [, k, min_score, ctx]) → number` | `req_id` | 异步检索（最后一个 table 参数视为 ctx） |
+
+`RAGHit`: `{tag=string, score=number}`（score 为相似度 0~1，越高越相似；完全相同的文本 ≈0.99+，语义相关通常 0.6~0.95）。
+
+```lua
+-- 同步写入 + 检索
+local ok, err = jn.rag.add("3af2b489-b13a-42e4-af98-fe89d0e6b00e", "要入库的文本")
+local hits, err = jn.rag.search("查询内容", 5, 0.5)
+for _, h in ipairs(hits or {}) do
+    jn.log.info(h.tag .. " score=" .. h.score)
+end
+
+-- 异步：立即返回 req_id，完成回调 on_rag_response
+local rid = jn.rag.search_async("查询内容", 5, 0.5, { group_id = 987654321 })
+function on_rag_response(req_id, ctx, result, err)
+    if err then jn.log.warn("RAG 检索失败: " .. err) return end
+    -- add_async 的 result 为 tag 字符串；search_async 的 result 为 [{tag, score}] 表
+end
+```
+
 ## 全局表: `agent`
 
 权限：`agent`。提供 Agent 配置查询与运行时管理（共 17 个函数）。
@@ -6612,6 +6897,7 @@ end
 | `t2i` | `t2i.generate_async` / `t2i.generate_url_async` | `on_t2i_response` | `(req_id, ctx, result, err)` |
 | `http` | `http.get_async` / `http.post_async` | `on_http_response` | `(req_id, ctx, result, err)` |
 | `sandbox` | `sandbox.create_async` / `exec_shell_async` / `exec_python_async` | `on_sandbox_response` | `(req_id, ctx, result, err)` |
+| `rag` | `rag.add_async` / `rag.search_async` | `on_rag_response` | `(req_id, ctx, result, err)` |
 
 > **调用现场保存（ctx）**：`t2i` / `http` 异步回调带 `ctx` 参数——调用时把要保留的变量打包成一张表作为最后一个参数传入（如 `generate_async(html, opts, ctx)`），引擎按 `req_id` 关联保存，回调时**原样带回**（不序列化，可含函数）。用于延续调用前的业务状态（待处理消息、群号、临时标记等）；不传则为 `nil`。`llm.chat_async` 不带 `ctx`（回调签名保持 `(req_id, content, err)`，兼容现有插件）。
 >
@@ -6829,6 +7115,10 @@ function on_sandbox_response(req_id, ctx, result, err)
     -- result: create→{sandbox_id, status}、exec_shell→{output, exit_code}、
     --         exec_python→{output, error}；err 非 nil 表示失败
 end
+
+function on_rag_response(req_id, ctx, result, err)
+    -- result: add_async→tag 字符串、search_async→[{tag, score}] 表；err 非 nil 表示失败
+end
 ```
 
 | 回调 | req_id 来源 | ctx | result |
@@ -6836,6 +7126,7 @@ end
 | `on_t2i_response(req_id, ctx, result, err)` | `t2i.generate_async` / `t2i.generate_url_async` | 调用现场表（原样带回） | 图片 ID / URL |
 | `on_http_response(req_id, ctx, result, err)` | `http.get_async` / `http.post_async` | 同上 | `{status, body}` |
 | `on_sandbox_response(req_id, ctx, result, err)` | `sandbox.create_async` / `exec_shell_async` / `exec_python_async` | 同上 | 见上注释 |
+| `on_rag_response(req_id, ctx, result, err)` | `rag.add_async` / `rag.search_async` | 同上 | add→tag；search→`[{tag, score}]` |
 
 ```lua
 -- 示例：http 异步 + 现场保存（url 与回调目标一起带到回调）
@@ -6862,6 +7153,7 @@ end
 | `cache` | `cache.*` |
 | `t2i` | `t2i.*` |
 | `sandbox` | `sandbox.*` |
+| `rag` | `rag.*` |
 | `agent` | `agent.*` |
 | (webhook 调用层过滤) | `on_webhook` 会被调用 |
 | (cronjob 调用层过滤) | `on_cronjob` 会被调用 |
@@ -6936,6 +7228,7 @@ func (pe *PluginEngine) injectBaseAPI(L *lua.LState, pluginName string, permissi
     if plugin.HasPermission("cache")&&pe.cache!=nil     { ... }
     if plugin.HasPermission("t2i")                     { ... }
     if plugin.HasPermission("sandbox")                 { ... }
+    if plugin.HasPermission("rag")                     { ... }
     if plugin.HasPermission("agent")&&pe.dao!=nil      { ... }
 }
 ```
@@ -7412,6 +7705,8 @@ plugins/<name>/
 
 `pluggin.yaml` + `main.lua` 为必需；`config.yaml` / `README.md` / `avatar.png` 缺失时插件仍可运行，但商店会标记缺项。
 
+> ⚠️ **`redrock_group_manager` 已系统化**：群管理（违禁言论检测 / 刷屏复读 / 三级惩罚 / 白名单豁免）已升级为主程序 Go 原生系统功能（`internal/agent/groupmgr`，检测闸门位于事件循环 Phase 0.5）。旧 Lua 插件继续存在但**不建议再安装**——与系统功能同时启用会导致双重检测重复处罚。部署时请停用旧插件（Web 群管理页顶部有警告横幅）。
+
 ## 2. 动态配置（config.yaml + jn.config）
 
 ### config.yaml 声明
@@ -7708,10 +8003,11 @@ make run
 2. **配置 LLM Provider**：「Providers」页添加 OpenAI 兼容端点（Base URL / API Key / 模型名），并激活为文本模型
 3. **配置 Adapter**：「Adapter」页设置 `OB_TOKEN` 与 admin QQ，启用
 4. **连接 OneBot11 客户端**：让 NapCat/Lagrange 以反向 WS 方式连接 `ws://<你的服务器>:8081/`，携带 `Authorization: Bearer <OB_TOKEN>`
-5. **配置回复策略**：「回复策略」页设置群聊行为（`always` / `at_only` / `relevance` / `never_reply`）
-6. 可选：配置 T2I（文生图）、Sandbox（代码沙箱）、知识库等。T2I 与 Sandbox 需先自行部署依赖服务：
+5. **配置回复策略**：「回复策略」页设置群聊行为（仅 `relevance` 按相关性回复：@/命令/提及名字必回，其余由 LLM 判断）
+6. 可选：配置 T2I（文生图）、Sandbox（代码沙箱）、RAG（语义检索）、知识库等。T2I / Sandbox / RAG 需先自行部署依赖服务：
    - T2I：[astrbot-t2i-service](https://github.com/AstrBotDevs/astrbot-t2i-service) → `docker run -itd -p 8999:8999 soulter/astrbot-t2i-service:latest`
    - Sandbox：[shipyard-neo](https://github.com/AstrBotDevs/shipyard-neo)
+   - RAG：[JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service) → `make download && cargo run --release`（不部署也能跑，检索自动降级）
    - 然后在 Web 面板对应页面填写服务地址并启用（详见[外部服务](development/external-services.md)）
 
 ## 验证部署
