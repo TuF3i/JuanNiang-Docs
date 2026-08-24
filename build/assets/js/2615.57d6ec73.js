@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunkjuan_niang_docs||=[]).push([[2615],{2615(a,e,s){s.d(e,{createWardleyServices:()=>c.J});var c=s(1072);s(9697)}}]);

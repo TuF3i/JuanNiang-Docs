@@ -1,0 +1,1 @@
+"use strict";(globalThis.webpackChunkjuan_niang_docs||=[]).push([[7881],{7881(e,a,s){s.d(a,{createPieServices:()=>c.f});var c=s(4253);s(9697)}}]);
