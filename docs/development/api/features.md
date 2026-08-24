@@ -70,9 +70,11 @@ curl -X POST http://localhost:8090/api/v1/plugins/upload \
 
 ## 2. 知识库
 
-SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对话前按关键词/内容模糊匹配，命中结果注入系统提示词（LRU 50 条缓存加速）。
+SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对话前**首选 RAG 语义检索**（需配置 RAG-Service），未配置/失败/无命中降级为关键词 + 内容模糊匹配（LRU 50 条缓存加速），命中结果注入系统提示词。
 
 > `keyword_status`：`pending`（提取中，暂不参与匹配）→ `ready`（可匹配）→ `failed`（提取失败，可手动重试）。新增/编辑后自动异步提取关键词。
+>
+> **RAG 双写双删**：新增/编辑知识时同步 Upsert 向量（RAG 未配置静默跳过、失败仅告警），删除时同步删向量；tag 为 UUID v5 派生（`k:<id>`），与记忆/群管理集合隔离。
 
 ### GET /knowledge
 分页列出。**Query** `page`（默认 1）、`page_size`（默认 20，上限 100）。
@@ -95,6 +97,9 @@ SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对
 
 ### POST /knowledge/:id/re-extract
 手动重试关键词提取（`failed` 状态时用）。**data** `null`。
+
+### POST /knowledge/vector-sync
+**手动全量同步向量库**：把全部知识条目批量 Upsert 到 RAG-Service（50 条一批，幂等，可反复触发）。**data** `{total int, failed int}`。
 
 `KnowledgeResp`: `id`、`title`、`content`、`keywords` string[]、`keyword_status`、`created_at`、`updated_at`。
 
@@ -291,6 +296,69 @@ Plugin 与 Agent 发送消息时，用 `[CQ:image,file=imgs://<id>]` 引用图�
 手动触发立即执行（沿块链顺序：消息块发一条消息，延时块等待）。**data** `null`。
 
 `ScheduledMessageResp`: `id`、`name`、`enabled`、`cron_expr`、`target_type`、`target_id`、`blocks`、`last_run_at`、`last_error`、`created_at`、`updated_at`。
+
+---
+
+
+## 7. 群管理（系统级）
+
+Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `redrock_group_manager`）：违禁言论检测（RAG 语义核实首选 + LLM 审核 + 学习闭环）、图片刷屏 / +1 复读、入群统计、三级惩罚、白名单/管理员豁免。检测闸门位于事件循环 Phase 0.5（先于所有插件），架构见 [architecture.md](../architecture.md#群管理检测闸门phase-05系统级)。
+
+### GET /group-mgr/config
+读取配置。**data** `GroupMgrConfigResp`：`enabled`、`llm_review`、`high_score`、`low_score`、`fallback_score`、`img_spam_window`、`img_spam_threshold`、`img_mute_duration`、`enable_copy_check`、`copy_threshold`、`violation_mute_seconds`、`exclude_groups` string[]、`llm_criteria`、`llm_gray_prompt`、`llm_high_risk_prompt`。
+
+### PUT /group-mgr/config
+更新配置并热重载（非法值忽略保留原值）。**Body** `UpdateGroupMgrConfigReq`（同 Resp 字段，全部可选）。**data** `GroupMgrConfigResp`。
+
+### GET /group-mgr/words
+词条列表。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
+
+### POST /group-mgr/words
+新增词条（RAG 可用时同步写入向量库）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
+
+### DELETE /group-mgr/words/:id
+删除词条（双删 RAG）。**data** `null`。
+
+### POST /group-mgr/words/import
+从 txt 文件导入词条（一行一个）。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
+
+### POST /group-mgr/sync-rag
+手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
+
+### GET /group-mgr/samples
+学习闭环样本列表（LLM 确认违规自动入库）。**data** `GroupMgrSampleResp[]`：`id`、`text`、`category`、`source`、`hit_count`、`created_at`。
+
+### DELETE /group-mgr/samples/:id
+删除样本（双删 RAG）。**data** `null`。
+
+### GET /group-mgr/violations
+违规记录列表。**data** `GroupMgrViolationResp[]`：`id`、`group_id`、`user_id`、`username`、`count`、`detection_path`（`rag`/`keyword`/`llm`）、`llm_reason`。
+
+### DELETE /group-mgr/violations/:id
+清除违规记录。**data** `null`。
+
+### GET /group-mgr/whitelist / PUT /group-mgr/whitelist
+白名单 QQ 列表。**data** `{qq_list int64[]}`（PUT Body 同）。
+
+### GET /group-mgr/admins / PUT /group-mgr/admins
+手动管理员 QQ 列表。**data** `{qq_list int64[]}`（PUT Body 同）。
+
+### POST /group-mgr/admins/sync-from-adapter
+从 Adapter `AdminQQNumbers` 同步管理员（增量合并）。**data** `{added int}`。
+
+### GET /group-mgr/stats
+群统计（`/groupstats` 命令同源）。**Query** `group_id`、`date`。**data** `GroupMgrStatsResp`：`group_id`、`date`、`join_today`、`warns`、`mutes`、`copy_warns`、`ad`、`sensitive`、`kicks`。
+
+### POST /group-mgr/test
+链路测试（**不处罚、不写库**）：输入文本跑完整判定链，返回各环节结果。**Body** `TestGroupMgrReq`: `text`。**data** `GroupMgrTestResp`（`card`/`word`/`rag_score`/`verdict`/`reason` 等）。
+
+---
+
+
+## 8. 长期记忆（RAG 同步）
+
+### POST /memory/sync-rag
+手动全量同步长期记忆到 RAG 向量库（补齐 Compact 双写前的历史记忆，幂等）。**data** `{total, failed}`。
 
 ---
 
