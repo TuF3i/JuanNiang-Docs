@@ -149,10 +149,11 @@ make run
 2. **配置 LLM Provider**：「Providers」页添加 OpenAI 兼容端点（Base URL / API Key / 模型名），并激活为文本模型
 3. **配置 Adapter**：「Adapter」页设置 `OB_TOKEN` 与 admin QQ，启用
 4. **连接 OneBot11 客户端**：让 NapCat/Lagrange 以反向 WS 方式连接 `ws://<你的服务器>:8081/`，携带 `Authorization: Bearer <OB_TOKEN>`
-5. **配置回复策略**：「回复策略」页设置群聊行为（`always` / `at_only` / `relevance` / `never_reply`）
-6. 可选：配置 T2I（文生图）、Sandbox（代码沙箱）、知识库等。T2I 与 Sandbox 需先自行部署依赖服务：
+5. **配置回复策略**：「回复策略」页设置群聊行为（仅 `relevance` 按相关性回复：@/命令/提及名字必回，其余由 LLM 判断）
+6. 可选：配置 T2I（文生图）、Sandbox（代码沙箱）、RAG（语义检索）、知识库等。T2I / Sandbox / RAG 需先自行部署依赖服务：
    - T2I：[astrbot-t2i-service](https://github.com/AstrBotDevs/astrbot-t2i-service) → `docker run -itd -p 8999:8999 soulter/astrbot-t2i-service:latest`
    - Sandbox：[shipyard-neo](https://github.com/AstrBotDevs/shipyard-neo)
+   - RAG：[JuanNiang-RAG-Service](https://github.com/JuanNiangDev/JuanNiang-RAG-Service) → `make download && cargo run --release`（不部署也能跑，检索自动降级）
    - 然后在 Web 面板对应页面填写服务地址并启用（详见[外部服务](development/external-services.md)）
 
 ## 验证部署
