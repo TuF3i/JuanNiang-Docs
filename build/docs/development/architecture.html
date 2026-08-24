@@ -17,7 +17,7 @@
 <meta name="twitter:description" content="基于 OneBot11 协议的 LLM QQ 聊天 Agent，支持插件扩展与二次开发。">
 <meta name="twitter:image:alt" content="JuanNiang-Neo 项目横幅">
 <script type="application/ld+json">{"@context":"https://schema.org","@type":"WebSite","name":"JuanNiang-Neo","alternateName":"卷娘","url":"https://docs.juan.team/","description":"卷娘（JuanNiang）是红岩网校的吉祥物。本仓库由重庆邮电大学红岩网校工作室开发，基于 Go 与 OneBot11 协议接入大模型的 QQ 聊天 Agent，支持 Lua 插件扩展、Web 管理后台与自部署。","inLanguage":"zh-CN","publisher":{"@type":"Organization","name":"重庆邮电大学红岩网校工作室","logo":{"@type":"ImageObject","url":"https://docs.juan.team/img/banner.webp"}}}</script><link rel="stylesheet" href="/assets/css/styles.829013f4.css">
-<script src="/assets/js/runtime~main.4b746f88.js" defer="defer"></script>
+<script src="/assets/js/runtime~main.8205b23f.js" defer="defer"></script>
 <script src="/assets/js/main.6886a46a.js" defer="defer"></script>
 </head>
 <body>
@@ -143,9 +143,10 @@
 <ul>
 <li class="">三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（<code>//go:embed</code> 内嵌）</li>
 <li class="">图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部<strong>面板可配置</strong>（<code>group_mgr_configs</code> 单行表，保存后热重载）</li>
+<li class="">RAG 语义核实三档判定<strong>统一要求硬信号</strong>（命中关键词或推荐卡片）：RAG-Service 向量库与知识/记忆共用，无硬信号时高置信命中可能是知识/记忆的语义干扰，一律放行</li>
 <li class="">系统命令：<code>/groupstats</code>、<code>/白名单</code>、<code>/豁免</code>、<code>/解除豁免</code>、<code>/取消豁免</code>（后注册覆盖插件同名命令，仅管理员）；<strong>/豁免 按群清除违规记录</strong>（不清其他群的三级惩罚阶梯），白名单为全局豁免</li>
 <li class="">Web API：<code>/group-mgr/*</code>（config/words/samples/violations/whitelist/admins/stats/test），详见 <a class="" href="/docs/development/api/features">Web API：功能模块</a></li>
-<li class="">词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步；<strong><code>rag_synced</code> 仅真实写入成功才置 true</strong>，删除词条时同步清理派生样本与 RAG 向量</li>
+<li class="">词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步（SSE 流式推送进度）；<strong><code>rag_synced</code> 仅真实写入成功才置 true</strong>，删除词条时同步清理派生样本与 RAG 向量</li>
 <li class="">健壮性：LLM 审核提示词带 <code>&lt;USER_TEXT&gt;</code> 定界符与指令忽略声明（防注入），判 none 且存在黑/敏感词或卡片硬信号时 <strong>fail-closed 直罚</strong>；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障</li>
 </ul>
 <h2 class="anchor anchorTargetStickyNavbar_xc_0" id="cronjob-注入流">CronJob 注入流<a href="#cronjob-注入流" class="hash-link" aria-label="CronJob 注入流的直接链接" title="CronJob 注入流的直接链接" translate="no">​</a></h2>
