@@ -552,9 +552,10 @@ flowchart TD
   EX -->|豁免| RET["放行（不进检测）"]
   EX --> CARD["推荐卡片文本化（不再直罚）"]
   CARD --> RAG["RAG 语义核实（第一核实人, 三档阈值）"]
-  RAG -->|score ≥ high_score| PUNISH["直接处罚（无词命中同样直罚）"]
-  RAG -->|low < score < high| LLM["LLM 审核（异常按 fallback_score 分数兜底）"]
-  RAG -->|score ≤ low| LOW["低置信"]
+  RAG -->|无硬信号| PASS2["放行（防知识/记忆语义干扰）"]
+  RAG -->|score ≥ high_score 且有硬信号| PUNISH["直接处罚"]
+  RAG -->|low < score < high 且有硬信号| LLM["LLM 审核（异常按 fallback_score 分数兜底）"]
+  RAG -->|score ≤ low 且有硬信号| LOW["低置信"]
   LOW -->|有词/卡片命中| LLM
   LOW -->|无硬信号| PASS["放行"]
   RAG -.RAG 不可用.| KW["降级关键词路径（= 旧插件行为）"]
@@ -564,9 +565,10 @@ flowchart TD
 
 - 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
 - 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
+- RAG 语义核实三档判定**统一要求硬信号**（命中关键词或推荐卡片）：RAG-Service 向量库与知识/记忆共用，无硬信号时高置信命中可能是知识/记忆的语义干扰，一律放行
 - 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）；**/豁免 按群清除违规记录**（不清其他群的三级惩罚阶梯），白名单为全局豁免
 - Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
-- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步；**`rag_synced` 仅真实写入成功才置 true**，删除词条时同步清理派生样本与 RAG 向量
+- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步（SSE 流式推送进度）；**`rag_synced` 仅真实写入成功才置 true**，删除词条时同步清理派生样本与 RAG 向量
 - 健壮性：LLM 审核提示词带 `<USER_TEXT>` 定界符与指令忽略声明（防注入），判 none 且存在黑/敏感词或卡片硬信号时 **fail-closed 直罚**；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障
 
 ## CronJob 注入流
