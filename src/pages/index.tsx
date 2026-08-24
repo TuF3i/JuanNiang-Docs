@@ -324,7 +324,7 @@ export default function Home(): JSX.Element {
                 <GithubInfo owner="JuanNiangDev" repo="JuanNiang-Docs" />
               </div>
             </div>
-            <div className="row">
+            <div className={`row ${styles.repoRowGap}`}>
               <div className="col col--4 col--offset-4">
                 <GithubInfo owner="JuanNiangDev" repo="JuanNiang-RAG-Service" />
               </div>

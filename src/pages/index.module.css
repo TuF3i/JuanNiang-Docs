@@ -164,6 +164,11 @@ html[data-theme='dark'] .heroMask {
   row-gap: 1.5rem;
 }
 
+/* 项目仓库第二行（RAG-Service 居中卡片）与第一行拉开间距 */
+.repoRowGap {
+  margin-top: 1.25rem;
+}
+
 /* 效果图区：响应式高度（16:9），窄屏由 min-height 兜底，避免固定 600px 留白过大 */
 .gallery {
   width: 100%;
