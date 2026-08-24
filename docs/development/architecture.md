@@ -565,7 +565,7 @@ flowchart TD
 - 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
 - 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
 - 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）
-- Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md#7-群管理)
+- Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
 - 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步
 
 ## CronJob 注入流
