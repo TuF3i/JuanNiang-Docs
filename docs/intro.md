@@ -58,4 +58,4 @@ title: 项目简介
 想**改主项目代码** → [本地开发环境](development/setup.md) 与 [开发指南](development/development.md)
 - 想**给卷娘写插件** → [插件开发指南](plugins/quickstart.md)
 
-> 详细架构（Eino ADK Agent / 三阶段事件循环 / 数据模型 / 插件系统）见 [架构与设计](development/architecture.md)。
+> 详细架构（Eino ADK Agent / 五阶段事件循环 / 数据模型 / 插件系统）见 [架构与设计](development/architecture.md)。

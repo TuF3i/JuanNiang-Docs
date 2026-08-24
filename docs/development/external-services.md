@@ -89,7 +89,7 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 ### Schema
 
-`core.Init` 调用 `AutoMigrate` 创建 23 张表。**不读 `sql/init.sql`**（仅文档参考）。GORM AutoMigrate 按列追加/索引同步，**不会删列**，开发期字段删除需手工 `ALTER TABLE`。
+`core.Init` 调用 `AutoMigrate` 创建 39 张表。**不读 `sql/init.sql`**（仅文档参考）。GORM AutoMigrate 按列追加/索引同步，**不会删列**，开发期字段删除需手工 `ALTER TABLE`。
 
 ## Redis
 

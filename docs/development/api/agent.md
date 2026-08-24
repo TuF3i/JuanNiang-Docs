@@ -271,31 +271,28 @@ Skill = 关键词/正则触发的 Prompt+Tool 组合配置。`priority` 越大�
 
 系统回复策略（单例，仅一行）。控制群聊中 Agent 对消息的回复行为。
 
-**ReplyStrategy 枚举**
+**策略已收敛为仅 `relevance`**（`never_reply` / `at_only` / `always` 已移除，存量行启动时幂等迁移；`strategy` 字段保留仅作返回展示，PUT 不再接受）。
 
 | 值 | 含义 |
 |----|------|
-| `never_reply` | 完全不回复 |
-| `at_only` | 仅被 @ 时回复 |
-| `always` | 始终回复（默认） |
 | `relevance` | 按相关性回复：@/命令/提及名字必回；噪音消息规则过滤；其余候选批量合并为一次 LLM 判断（受 `relevance_threshold` 影响），带结果缓存/冷却与刷屏降级 |
 
 ### GET /reply-strategy
-获取配置。首次 GET 不存在时自动创建（`strategy=always, relevance_threshold=0.5`）。
+获取配置。首次 GET 不存在时自动创建（`strategy=relevance, relevance_threshold=0.5`）。
 
 **data** `ReplyStrategyResp`: `strategy`、`relevance_threshold` float64、`bot_name`、`strip_markdown` bool、`agent_lite` bool、`relevance_prompt` string、`relevance_model` string、`relevance_timeout` int（相关性判断超时秒，默认 10）、`judge_fail_policy` string（`drop`=判断失败不回复（默认）/ `reply`=照常回复）。
 
 ### PUT /reply-strategy
-更新。
+更新（**`strategy` 字段不再接受，策略固定为 `relevance`**）。
 
-**Body** `UpdateReplyStrategyReq`: `strategy`、`relevance_threshold`（必填）；`bot_name`、`strip_markdown`、`agent_lite`（可选）；`relevance_prompt`（相关性检测自定义提示词，空=默认）、`relevance_model`（相关性检测 Text Provider ID，空=默认）、`relevance_timeout`（相关性判断超时秒，0=默认 10s，范围 1-120）、`judge_fail_policy`（`drop`/`reply`，空=默认 `drop`）。
+**Body** `UpdateReplyStrategyReq`: `relevance_threshold`（必填）；`bot_name`、`strip_markdown`、`agent_lite`（可选）；`relevance_prompt`（相关性检测自定义提示词，空=默认）、`relevance_model`（相关性检测 Text Provider ID，空=默认）、`relevance_timeout`（相关性判断超时秒，0=默认 10s，范围 1-120）、`judge_fail_policy`（`drop`/`reply`，空=默认 `drop`）。
 
 **data** `ReplyStrategyResp`。
 
 ```bash
 curl -X PUT http://localhost:8090/api/v1/reply-strategy \
   -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"strategy":"relevance","relevance_threshold":0.6,"bot_name":"小卷","judge_fail_policy":"reply"}'
+  -d '{"relevance_threshold":0.6,"bot_name":"小卷","judge_fail_policy":"reply"}'
 ```
 
 ---

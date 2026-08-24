@@ -282,7 +282,7 @@ WantedBy=multi-user.target
 
 1. 准备 Postgres + Redis（或直接 `make docker-up` 用 compose 拉起它们）
 2. 设置 `.env`（至少改 `JWT_SECRET`）
-3. 启动进程；首次会 AutoMigrate 23 张表 + 创建 `admin / Admin123`
+3. 启动进程；首次会 AutoMigrate 39 张表 + 创建 `admin / Admin123`
 4. 立即登录 Web 面板，`POST /change-password` 改默认密码
 5. 在"Providers"页配置 LLM Provider（OpenAI 兼容端点），激活
 6. 在"Adapter"页配置 OB_TOKEN 与 admin QQ，启用
