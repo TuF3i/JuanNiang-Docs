@@ -695,6 +695,9 @@ SQL 驱动知识库：Web 存入知识条目，Agent 异步提取关键词；对
 ### POST /knowledge/vector-sync
 **手动全量同步向量库**：把全部知识条目批量 Upsert 到 RAG-Service（50 条一批，幂等，可反复触发）。**data** `{total int, failed int}`。
 
+### GET /knowledge/vector-sync/stream
+**SSE 流式同步**（知识量大时避免单次 HTTP 超时）：每批（50 条）upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{ready, total, synced, failed}`，客户端断开即中止。需 `Authorization` 头（EventSource 不支持自定义头，前端用 fetch + ReadableStream 消费）。
+
 `KnowledgeResp`: `id`、`title`、`content`、`keywords` string[]、`keyword_status`、`created_at`、`updated_at`。
 
 ---
@@ -914,6 +917,9 @@ Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `
 ### POST /group-mgr/sync-rag
 手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
 
+### GET /group-mgr/sync-rag/stream
+**SSE 流式同步**（词条量大时避免单次 HTTP 超时）：每批 upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{total, failed}`，客户端断开即中止。
+
 ### GET /group-mgr/samples
 学习闭环样本列表（LLM 确认违规自动入库——**入库的是送审原文，而非 LLM 裁决 JSON**）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`text`、`category`、`source`、`hit_count`、`created_at`。
 
@@ -947,6 +953,9 @@ Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `
 
 ### POST /memory/sync-rag
 手动全量同步长期记忆到 RAG 向量库（补齐 Compact 双写前的历史记忆，幂等）。**data** `{total, failed}`。
+
+### GET /memory/sync-rag/stream
+**SSE 流式同步**（记忆量大时避免单次 HTTP 超时）：每批 upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{ready, total, synced, failed}`，客户端断开即中止。
 
 ---
 
