@@ -369,11 +369,19 @@ txt 导入违禁语录（multipart `file`，一行一个，≤1MB/≤20000 行�
 
 ## 8. 长期记忆（RAG 同步）
 
+### GET /memory/:chatAreaID/long-term
+读取长期记忆配置。**data** `LongTermMemoryResp`：`id`、`chat_area_id`、`hot_area_size`、`hot_memory_ttl`、`gc_interval_days`（记忆 GC 周期天，默认 7）、`created_at`。
+
+### PUT /memory/:chatAreaID/long-term
+更新长期记忆配置（保存后热重载）。**Body** `UpdateLongTermMemoryReq`：`hot_area_size`、`hot_memory_ttl`、`gc_interval_days`（可选，0 表示不修改）。**data** `LongTermMemoryResp`。
+
 ### POST /memory/sync-rag
 手动全量同步长期记忆到 RAG 向量库（补齐 Compact 双写前的历史记忆，幂等）。**data** `{total, failed}`。
 
 ### GET /memory/sync-rag/stream
 **SSE 流式同步**（记忆量大时避免单次 HTTP 超时）：每批 upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{ready, total, synced, failed}`，客户端断开即中止。
+
+> **记忆 GC**：默认 7 天执行一次，清理最近周期内未被召回（`last_recalled_at` 为空或超期）的 5 条记忆（Postgres + RAG 向量双删）。周期由 `gc_interval_days` 配置（记忆页可调）；召回命中会自动更新 `last_recalled_at`（对话召回与 RAG 召回均埋点）。
 
 ---
 
