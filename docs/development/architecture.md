@@ -496,7 +496,7 @@ flowchart TD
 
 > **Phase 0（幂等去重）**：群/私聊的 `message_id` 各自独立递增，key 带 `message_type` 前缀；WS 断线重连/多连接时 OneBot 端重复推送的同一消息直接丢弃（`h.msgDedup.SeenBefore`）。
 >
-> **Phase 0.5（系统级群管理）**：`h.GroupMgr.Process`（Go 原生，先于所有 Lua 插件）。白名单/管理员/排除群豁免 → 违禁言论检测（RAG 语义核实首选，高置信直罚 / 模棱两可送 LLM / 低置信有词送 LLM / 无词放行；RAG 不可用降级关键词）；图片刷屏 / +1 复读 `consumed=true` 拦截不进 Agent。详见下方「群管理检测闸门」章节。
+> **Phase 0.5（系统级群管理）**：`h.GroupMgr.Process`（Go 原生，先于所有 Lua 插件）。白名单/管理员/排除群豁免 → 违禁言论检测（RAG 黑白语录语义匹配首选：黑命中处罚 / 白命中放行，均未命中送 LLM 3s 批窗口逐条判定，RAG/LLM 均不可用降级关键词兜底）；图片刷屏 / +1 复读（跳过命令消息）`consumed=true` 拦截不进 Agent。详见下方「群管理检测闸门」章节。
 >
 > `checkReplyStrategyFast` 恒放行：回复策略已收敛为仅 `relevance`（@/命令/提及名字必回由规则快路径保证），LLM 相关性判断延后到 `dispatchToAgent` 的 goroutine 内由 `filterRelevant` 执行（`filterRelevant` → `relevanceBatchEvaluate`）：@/命令/提及名字 → 必回（0 次 LLM）；噪音消息（纯表情/过短/仅 URL）→ 规则丢弃；其余候选合并为**一次** LLM 批量判断（含图消息标注 `[图片]`，单条候选走原分数判断）。判断结果写 Redis（related=15s 对话轮次放宽 / unrelated=30s 冷却），判断并发全局上限 4、超时可配置（relevance_timeout，默认 10s），失败按 `judge_fail_policy`（drop/reply）降级；群聊刷屏（1s≥5 条）时批窗口拉长到 3s 并降级为只回必回消息。
 
@@ -551,25 +551,27 @@ flowchart TD
   MSG["群聊消息"] --> EX["豁免检查: 白名单 / 管理员 / 排除群"]
   EX -->|豁免| RET["放行（不进检测）"]
   EX --> CARD["推荐卡片文本化（不再直罚）"]
-  CARD --> RAG["RAG 语义核实（第一核实人, 三档阈值）"]
-  RAG -->|无硬信号| PASS2["放行（防知识/记忆语义干扰）"]
-  RAG -->|score ≥ high_score 且有硬信号| PUNISH["直接处罚"]
-  RAG -->|low < score < high 且有硬信号| LLM["LLM 审核（异常按 fallback_score 分数兜底）"]
-  RAG -->|score ≤ low 且有硬信号| LOW["低置信"]
-  LOW -->|有词/卡片命中| LLM
-  LOW -->|无硬信号| PASS["放行"]
+  CARD --> RAG["RAG 黑白语录语义匹配（第一核实人）"]
+  RAG -->|黑名单命中 score ≥ black_min_score| PUNISH["直接处罚"]
+  RAG -->|白名单命中 score ≥ white_min_score| PASS["放行"]
+  RAG -->|均未达阈值 或 无语录命中| LLM["LLM 批量判定（3s 批窗口, 逐条独立）"]
   RAG -.RAG 不可用.| KW["降级关键词路径（= 旧插件行为）"]
-  LLM -->|判定违规| PUNISH
-  PUNISH --> LEARN["学习闭环: 送审原文入库 + RAG Upsert（越用越准）"]
+  LLM -->|black| PUNISH
+  LLM -->|white| PASS
+  LLM -->|none| PASS2["放行"]
+  LLM -->|请求失败/裁决非法| FC["fail-closed：硬信号直罚, 否则放行"]
+  PUNISH --> LEARN["学习闭环: 送审原文异步入库 + RAG Upsert（越用越准）"]
+  PASS --> LEARN2["学习闭环: 白名单语录异步入库"]
 ```
 
-- 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
-- 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
-- RAG 语义核实三档判定**统一要求硬信号**（命中关键词或推荐卡片）：RAG-Service 向量库与知识/记忆共用，无硬信号时高置信命中可能是知识/记忆的语义干扰，一律放行
+- 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）；复读检测**跳过命令消息**（`/` 前缀）
+- 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、RAG 黑白阈值（`black_min_score`/`white_min_score`）、LLM 批窗口（`llm_batch_window`，默认 3s）、排除群/白名单/统一提示词（`llm_prompt`）全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
+- RAG 判定**不再要求硬信号**：黑白语录双集合各自独立，黑命中处罚、白命中放行；RAG 服务可用但无语录命中（含知识/记忆向量干扰的命中）一律**送 LLM 判定**，不再误判为“RAG 不可用”降级关键词
+- 学习闭环：LLM 判 black → 黑名单语录（Postgres + RAG 双写），判 white → 白名单语录；异步 goroutine 串行写入（`learnMu`），幂等去重 + 每集合 2000 条上限；RAG 未配置静默跳过（`rag_synced` 仅真实写入成功才置 true）
 - 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）；**/豁免 按群清除违规记录**（不清其他群的三级惩罚阶梯），白名单为全局豁免
-- Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
-- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步（SSE 流式推送进度）；**`rag_synced` 仅真实写入成功才置 true**，删除词条时同步清理派生样本与 RAG 向量
-- 健壮性：LLM 审核提示词带 `<USER_TEXT>` 定界符与指令忽略声明（防注入），判 none 且存在黑/敏感词或卡片硬信号时 **fail-closed 直罚**；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障
+- Web API：`/group-mgr/*`（config/phrases/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
+- **GC 功能**：长期记忆 GC（默认 7 天，`LongTermMemory.GCIntervalDays` 面板可配）清理最近周期未召回的 5 条（PG + RAG 双删）；白名单语录 GC（默认 7 天，`white_gc_interval_days` 面板可配）清理未命中的 5 条（PG + RAG 双删）
+- 健壮性：LLM 批量判定提示词带 `<USER_TEXT>` 定界符与指令忽略声明（防注入），输出格式契约由代码内提示词固定（不依赖外部 `LLMPrompt` 是否被改）；LLM 请求失败/裁决非法时 fail-closed（有硬信号直罚，否则放行）；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障
 
 ## CronJob 注入流
 

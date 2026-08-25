@@ -147,7 +147,7 @@ scrape_configs:
 
 - **总览**：事件吞吐（`rate(juanniang_events_total[5m])`）、Agent 循环结果（`by outcome`）、LLM 请求（`by provider`）、群管理处罚（`by action`）、外部服务健康（`juanniang_external_health`，0/1）
 - **长尾**：`histogram_quantile(0.95, sum(rate(<xxx>_duration_seconds_bucket[5m])) by (le))` 看 LLM / Agent 循环 / HTTP / RAG 检索延迟
-- **群管理调阈值**：`juanniang_groupmgr_rag_score` 分数分布，对照面板 `high_score` / `low_score`
+- **群管理调阈值**：`juanniang_groupmgr_rag_score` 分数分布，对照面板 `black_min_score`（黑名单直罚）/ `white_min_score`（白名单放行）参考线；`juanniang_groupmgr_llm_reviews_total` 看 LLM 批量判定分布（black/white/none/error）
 - **降级监控**：`juanniang_rag_search_errors_total`、`juanniang_message_dropped_total{reason="irrelevant"}`
 
 完整指标清单见 [Web API：适配器与会话](development/api/infra.md#9-metricsprometheus)。

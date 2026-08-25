@@ -189,7 +189,7 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 - 启动时 `loadRAGFromDB`（`cmd/server/main.go`）读 `rag_configs` 单行（**默认未启用**），创建客户端后同时注入 `HagoCenter.RAGClient`（`atomic.Pointer`）与 `Memory.SetRAGClient`（Compact 双写记忆向量）；`Service.OnUpdateRAG` 回调：每次 `PUT /rag/config` 用最新配置重建 `*Client` 并注入，停用/失败置 nil（= 降级开关）
 - 客户端经 `agentOp.GetRAGClient()`（`pluggin.AgentOperator`）供插件动态获取，热更新即时生效
-- **tag 隔离**：知识/记忆/群管理词条·样本共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（`internal/core/ragtag`：`k:`/`m:`/`w:`/`s:`），互不污染
+- **tag 隔离**：知识/记忆/群管理词条·样本·语录共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（`internal/core/ragtag`：`k:`/`m:`/`w:`/`s:`/`wt:`），互不污染；`wt:` 为白名单语录（命中放行），`s:` 为黑名单语录/词条派生样本
 
 ### 降级语义（任何 RAG 故障都不影响主流程）
 
@@ -197,10 +197,10 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 | 调用方 | 首选 | 降级 |
 |--------|------|------|
-| 知识库检索 | RAG 语义检索（命中按分数注入 ≤5 条） | SQL 关键词 + ILIKE 匹配（接入前行为） |
-| 长期记忆召回 | RAG 向量语义 | pg_trgm gram 候选 → 最近条目（三级降级链；pg_trgm 扩展创建失败时自动回退最近条目，不阻断启动） |
-| 群管理违禁检测 | RAG 语义核实（三档阈值） | 关键词路径（= 旧插件行为） |
-| 群管理词条/样本写入 | RAG 可用时同步 Upsert | 未配置静默跳过、失败仅告警（`rag_synced` 仅真实写入成功才置 true） |
+| 知识库检索 | RAG 语义检索（命中按分数注入 ≤5 条；`k=50`） | SQL 关键词 + ILIKE 匹配（接入前行为） |
+| 长期记忆召回 | RAG 向量语义（`k=50`） | pg_trgm gram 候选 → 最近条目（三级降级链；pg_trgm 扩展创建失败时自动回退最近条目，不阻断启动） |
+| 群管理违禁检测 | RAG 黑白语录语义匹配（黑命中 ≥ `black_min_score` 处罚 / 白命中 ≥ `white_min_score` 放行，`k=30`）；RAG 可用但无语录命中 → 送 LLM 批量判定 | 关键词路径（= 旧插件行为，仅 RAG/LLM 均不可用时） |
+| 群管理词条/语录写入 | RAG 可用时同步 Upsert（学习闭环/导入/手动同步） | 未配置静默跳过、失败仅告警（`rag_synced` 仅真实写入成功才置 true） |
 
 ### 接入指南
 
