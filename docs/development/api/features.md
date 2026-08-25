@@ -305,40 +305,46 @@ Plugin 与 Agent 发送消息时，用 `[CQ:image,file=imgs://<id>]` 引用图�
 
 ## 7. 群管理（系统级）
 
-Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `redrock_group_manager`）：违禁言论检测（RAG 语义核实首选 + LLM 审核 + 学习闭环）、图片刷屏 / +1 复读、入群统计、三级惩罚、白名单/管理员豁免。检测闸门位于事件循环 Phase 0.5（先于所有插件），架构见 [architecture.md](../architecture.md#群管理检测闸门phase-05系统级)。
+Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `redrock_group_manager`）：违禁言论检测（RAG 黑白语录语义匹配首选 + LLM 批量判定兜底 + 学习闭环）、图片刷屏 / +1 复读（跳过命令消息）、入群统计、三级惩罚、白名单/管理员豁免。检测闸门位于事件循环 Phase 0.5（先于所有插件），架构见 [architecture.md](../architecture.md#群管理检测闸门phase-05系统级)。
 
 ### GET /group-mgr/config
-读取配置。**data** `GroupMgrConfigResp`：`enabled`、`llm_review`、`high_score`、`low_score`、`fallback_score`、`img_spam_window`、`img_spam_threshold`、`img_mute_duration`、`enable_copy_check`、`copy_threshold`、`violation_mute_seconds`、`exclude_groups` string[]、`llm_criteria`、`llm_gray_prompt`、`llm_high_risk_prompt`。
+读取配置。**data** `GroupMgrConfigResp`：`enabled`、`llm_review`、`black_min_score`（黑名单语录命中阈值，默认 0.7）、`white_min_score`（白名单语录命中阈值，默认 0.75）、`llm_batch_window`（LLM 判定批窗口秒数，默认 3）、`img_spam_window`、`img_spam_threshold`、`img_mute_duration`、`enable_copy_check`、`copy_threshold`、`violation_mute_seconds`、`exclude_groups` string[]、`llm_prompt`（统一检测提示词）、`white_gc_interval_days`（白名单语录 GC 周期天，默认 7）。旧字段 `high_score`/`low_score`/`fallback_score`/`llm_criteria`/`llm_gray_prompt`/`llm_high_risk_prompt` 已废弃（保留兼容）。
 
 ### PUT /group-mgr/config
 更新配置并热重载（非法值忽略保留原值）。**Body** `UpdateGroupMgrConfigReq`（同 Resp 字段，全部可选）。**data** `GroupMgrConfigResp`。
 
 ### GET /group-mgr/words
-词条列表。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
+词条列表（**仅关键词兜底用，面板不再展示**）。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
 
 ### POST /group-mgr/words
-新增词条（RAG 可用时同步写入向量库；**仅真实写入 RAG 成功才标记 `rag_synced=true`**）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
+新增词条（仅兜底，应用层保留写入接口；RAG 可用时同步写入向量库，**仅真实写入 RAG 成功才标记 `rag_synced=true`**）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
 
 ### DELETE /group-mgr/words/:id
-删除词条（软删），**同步清理其派生样本与 RAG 向量（双删）**——删除后不再参与 RAG 检测；软删后可重建同名（部分唯一索引 + 软删行复活）。**data** `null`。
+删除词条（软删），**同步清理其派生样本与 RAG 向量（双删）**——删除后不再参与检测；软删后可重建同名（部分唯一索引 + 软删行复活）。**data** `null`。
 
 ### POST /group-mgr/words/import
 从 txt 文件导入词条（一行一个）。**限制**：单文件 ≤ 1MB、行数 ≤ 20000，超出返回 `40051`。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
 
 ### POST /group-mgr/sync-rag
-手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
+手动全量同步词条派生样本 + 语录到 RAG 向量库（幂等，50 条/批），成功条目标记 `rag_synced=true`。RAG 未配置返回错误。**data** `{total, failed}`。
 
 ### GET /group-mgr/sync-rag/stream
-**SSE 流式同步**（词条量大时避免单次 HTTP 超时）：每批 upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{total, failed}`，客户端断开即中止。
+**SSE 流式同步**（语录量大时避免单次 HTTP 超时）：每批 upsert 后推送 `data: {done, failed}`，结束推 `data: {total, failed}`；RAG 未配置推送 `data: {message}`，客户端断开即中止。
 
-### GET /group-mgr/samples
-学习闭环样本列表（LLM 确认违规自动入库——**入库的是送审原文，而非 LLM 裁决 JSON**）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`text`、`category`、`source`、`hit_count`、`created_at`。
+### GET /group-mgr/samples?list_type=
+违禁语录列表（`list_type` 可选 `black`/`white`，缺省全部）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`list_type`（black/white）、`text`、`category`、`source`（seed/learn/import）、`hit_count`、`rag_synced` bool、`rag_tag`（派生 RAG tag UUID，black=`ragtag.Sample(id)` / white=`ragtag.WhitePhrase(id)`）、`last_used_at`（最近命中时间，GC 用）、`created_at`。学习闭环入库的是**送审原文，而非 LLM 裁决 JSON**。
+
+### POST /group-mgr/phrases
+新增违禁语录（黑/白名单，单条添加）。**Body** `AddGroupMgrPhraseReq`: `text`、`list_type`（black/white，必填）、`category`（可选 ad/sensitive）。RAG 可用时同步写向量库并标记 `rag_synced=true`，不可用仅存库（可手动同步）。**data** `null`。
+
+### POST /group-mgr/phrases/import?list_type=
+txt 导入违禁语录（multipart `file`，一行一个，≤1MB/≤20000 行）。**data** `{imported, skipped}`。
 
 ### DELETE /group-mgr/samples/:id
-删除样本（双删 RAG）。**data** `null`。
+删除语录（Postgres + RAG 双删，未配置静默跳过）。**data** `null`。
 
 ### GET /group-mgr/violations
-违规记录列表。**data** `GroupMgrViolationResp[]`：`id`、`group_id`、`user_id`、`username`、`count`、`detection_path`（`rag`/`keyword`/`llm`）、`llm_reason`。
+违规记录列表。**data** `GroupMgrViolationResp[]`：`id`、`group_id`、`user_id`、`username`（处罚时群名片/昵称，LLM 追罚路径快照入批）、`count`、`detection_path`（`rag`/`llm`/`keyword`）、`llm_reason`。
 
 ### DELETE /group-mgr/violations/:id
 清除违规记录。**data** `null`。
@@ -356,7 +362,7 @@ Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `
 群统计（`/groupstats` 命令同源）。**Query** `group_id`、`date`。**data** `GroupMgrStatsResp`：`group_id`、`date`、`join_today`、`warns`、`mutes`、`copy_warns`、`ad`、`sensitive`、`kicks`。
 
 ### POST /group-mgr/test
-链路测试（**不处罚、不写库**）：输入文本跑完整判定链，返回各环节结果。**Body** `TestGroupMgrReq`: `text`。**data** `GroupMgrTestResp`（`card`/`word`/`rag_score`/`verdict`/`reason` 等）。
+链路测试（**不处罚、不写库**）：输入文本跑完整判定链，返回各环节结果。**Body** `TestGroupMgrReq`: `text`。**data** `GroupMgrTestResp`：`text`、`card`、`word`（兜底词）、`word_cat`、`rag_ok`、`black_score`/`black_phrase`、`white_score`/`white_phrase`、`verdict`（punish/review/pass）、`reason`。
 
 ---
 
