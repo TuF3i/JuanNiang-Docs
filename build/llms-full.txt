@@ -151,7 +151,7 @@ scrape_configs:
 
 - **总览**：事件吞吐（`rate(juanniang_events_total[5m])`）、Agent 循环结果（`by outcome`）、LLM 请求（`by provider`）、群管理处罚（`by action`）、外部服务健康（`juanniang_external_health`，0/1）
 - **长尾**：`histogram_quantile(0.95, sum(rate(<xxx>_duration_seconds_bucket[5m])) by (le))` 看 LLM / Agent 循环 / HTTP / RAG 检索延迟
-- **群管理调阈值**：`juanniang_groupmgr_rag_score` 分数分布，对照面板 `high_score` / `low_score`
+- **群管理调阈值**：`juanniang_groupmgr_rag_score` 分数分布，对照面板 `black_min_score`（黑名单直罚）/ `white_min_score`（白名单放行）参考线；`juanniang_groupmgr_llm_reviews_total` 看 LLM 批量判定分布（black/white/none/error）
 - **降级监控**：`juanniang_rag_search_errors_total`、`juanniang_message_dropped_total{reason="irrelevant"}`
 
 完整指标清单见 [Web API：适配器与会话](development/api/infra.md#9-metricsprometheus)。
@@ -894,40 +894,46 @@ Plugin 与 Agent 发送消息时，用 `[CQ:image,file=imgs://<id>]` 引用图�
 
 ## 7. 群管理（系统级）
 
-Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `redrock_group_manager`）：违禁言论检测（RAG 语义核实首选 + LLM 审核 + 学习闭环）、图片刷屏 / +1 复读、入群统计、三级惩罚、白名单/管理员豁免。检测闸门位于事件循环 Phase 0.5（先于所有插件），架构见 [architecture.md](../architecture.md#群管理检测闸门phase-05系统级)。
+Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `redrock_group_manager`）：违禁言论检测（RAG 黑白语录语义匹配首选 + LLM 批量判定兜底 + 学习闭环）、图片刷屏 / +1 复读（跳过命令消息）、入群统计、三级惩罚、白名单/管理员豁免。检测闸门位于事件循环 Phase 0.5（先于所有插件），架构见 [architecture.md](../architecture.md#群管理检测闸门phase-05系统级)。
 
 ### GET /group-mgr/config
-读取配置。**data** `GroupMgrConfigResp`：`enabled`、`llm_review`、`high_score`、`low_score`、`fallback_score`、`img_spam_window`、`img_spam_threshold`、`img_mute_duration`、`enable_copy_check`、`copy_threshold`、`violation_mute_seconds`、`exclude_groups` string[]、`llm_criteria`、`llm_gray_prompt`、`llm_high_risk_prompt`。
+读取配置。**data** `GroupMgrConfigResp`：`enabled`、`llm_review`、`black_min_score`（黑名单语录命中阈值，默认 0.7）、`white_min_score`（白名单语录命中阈值，默认 0.75）、`llm_batch_window`（LLM 判定批窗口秒数，默认 3）、`img_spam_window`、`img_spam_threshold`、`img_mute_duration`、`enable_copy_check`、`copy_threshold`、`violation_mute_seconds`、`exclude_groups` string[]、`llm_prompt`（统一检测提示词）、`white_gc_interval_days`（白名单语录 GC 周期天，默认 7）。旧字段 `high_score`/`low_score`/`fallback_score`/`llm_criteria`/`llm_gray_prompt`/`llm_high_risk_prompt` 已废弃（保留兼容）。
 
 ### PUT /group-mgr/config
 更新配置并热重载（非法值忽略保留原值）。**Body** `UpdateGroupMgrConfigReq`（同 Resp 字段，全部可选）。**data** `GroupMgrConfigResp`。
 
 ### GET /group-mgr/words
-词条列表。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
+词条列表（**仅关键词兜底用，面板不再展示**）。**Query** `category`（`black`/`gray`/`sensitive`，可选）。**data** `GroupMgrWordResp[]`：`id`、`word`、`category`、`source`（`system`/`import`）、`rag_synced` bool、`rag_tag`。
 
 ### POST /group-mgr/words
-新增词条（RAG 可用时同步写入向量库；**仅真实写入 RAG 成功才标记 `rag_synced=true`**）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
+新增词条（仅兜底，应用层保留写入接口；RAG 可用时同步写入向量库，**仅真实写入 RAG 成功才标记 `rag_synced=true`**）。**Body** `AddGroupMgrWordReq`: `word`、`category`。**data** `null`。
 
 ### DELETE /group-mgr/words/:id
-删除词条（软删），**同步清理其派生样本与 RAG 向量（双删）**——删除后不再参与 RAG 检测；软删后可重建同名（部分唯一索引 + 软删行复活）。**data** `null`。
+删除词条（软删），**同步清理其派生样本与 RAG 向量（双删）**——删除后不再参与检测；软删后可重建同名（部分唯一索引 + 软删行复活）。**data** `null`。
 
 ### POST /group-mgr/words/import
 从 txt 文件导入词条（一行一个）。**限制**：单文件 ≤ 1MB、行数 ≤ 20000，超出返回 `40051`。**multipart/form-data**：`file`、Query `category`。**data** `{imported, skipped}`。
 
 ### POST /group-mgr/sync-rag
-手动全量同步词条 + 样本到 RAG 向量库（幂等）。**data** `{total, failed}`。
+手动全量同步词条派生样本 + 语录到 RAG 向量库（幂等，50 条/批），成功条目标记 `rag_synced=true`。RAG 未配置返回错误。**data** `{total, failed}`。
 
 ### GET /group-mgr/sync-rag/stream
-**SSE 流式同步**（词条量大时避免单次 HTTP 超时）：每批 upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{total, failed}`，客户端断开即中止。
+**SSE 流式同步**（语录量大时避免单次 HTTP 超时）：每批 upsert 后推送 `data: {done, failed}`，结束推 `data: {total, failed}`；RAG 未配置推送 `data: {message}`，客户端断开即中止。
 
-### GET /group-mgr/samples
-学习闭环样本列表（LLM 确认违规自动入库——**入库的是送审原文，而非 LLM 裁决 JSON**）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`text`、`category`、`source`、`hit_count`、`created_at`。
+### GET /group-mgr/samples?list_type=
+违禁语录列表（`list_type` 可选 `black`/`white`，缺省全部）。**data** `GroupMgrSampleResp[]`：`id`、`word_id`（关联词条 ID，0=非词条派生）、`list_type`（black/white）、`text`、`category`、`source`（seed/learn/import）、`hit_count`、`rag_synced` bool、`rag_tag`（派生 RAG tag UUID，black=`ragtag.Sample(id)` / white=`ragtag.WhitePhrase(id)`）、`last_used_at`（最近命中时间，GC 用）、`created_at`。学习闭环入库的是**送审原文，而非 LLM 裁决 JSON**。
+
+### POST /group-mgr/phrases
+新增违禁语录（黑/白名单，单条添加）。**Body** `AddGroupMgrPhraseReq`: `text`、`list_type`（black/white，必填）、`category`（可选 ad/sensitive）。RAG 可用时同步写向量库并标记 `rag_synced=true`，不可用仅存库（可手动同步）。**data** `null`。
+
+### POST /group-mgr/phrases/import?list_type=
+txt 导入违禁语录（multipart `file`，一行一个，≤1MB/≤20000 行）。**data** `{imported, skipped}`。
 
 ### DELETE /group-mgr/samples/:id
-删除样本（双删 RAG）。**data** `null`。
+删除语录（Postgres + RAG 双删，未配置静默跳过）。**data** `null`。
 
 ### GET /group-mgr/violations
-违规记录列表。**data** `GroupMgrViolationResp[]`：`id`、`group_id`、`user_id`、`username`、`count`、`detection_path`（`rag`/`keyword`/`llm`）、`llm_reason`。
+违规记录列表。**data** `GroupMgrViolationResp[]`：`id`、`group_id`、`user_id`、`username`（处罚时群名片/昵称，LLM 追罚路径快照入批）、`count`、`detection_path`（`rag`/`llm`/`keyword`）、`llm_reason`。
 
 ### DELETE /group-mgr/violations/:id
 清除违规记录。**data** `null`。
@@ -945,17 +951,25 @@ Go 原生的群管理功能（`internal/agent/groupmgr`，替代旧 Lua 插件 `
 群统计（`/groupstats` 命令同源）。**Query** `group_id`、`date`。**data** `GroupMgrStatsResp`：`group_id`、`date`、`join_today`、`warns`、`mutes`、`copy_warns`、`ad`、`sensitive`、`kicks`。
 
 ### POST /group-mgr/test
-链路测试（**不处罚、不写库**）：输入文本跑完整判定链，返回各环节结果。**Body** `TestGroupMgrReq`: `text`。**data** `GroupMgrTestResp`（`card`/`word`/`rag_score`/`verdict`/`reason` 等）。
+链路测试（**不处罚、不写库**）：输入文本跑完整判定链，返回各环节结果。**Body** `TestGroupMgrReq`: `text`。**data** `GroupMgrTestResp`：`text`、`card`、`word`（兜底词）、`word_cat`、`rag_ok`、`black_score`/`black_phrase`、`white_score`/`white_phrase`、`verdict`（punish/review/pass）、`reason`。
 
 ---
 
 ## 8. 长期记忆（RAG 同步）
+
+### GET /memory/:chatAreaID/long-term
+读取长期记忆配置。**data** `LongTermMemoryResp`：`id`、`chat_area_id`、`hot_area_size`、`hot_memory_ttl`、`gc_interval_days`（记忆 GC 周期天，默认 7）、`created_at`。
+
+### PUT /memory/:chatAreaID/long-term
+更新长期记忆配置（保存后热重载）。**Body** `UpdateLongTermMemoryReq`：`hot_area_size`、`hot_memory_ttl`、`gc_interval_days`（可选，0 表示不修改）。**data** `LongTermMemoryResp`。
 
 ### POST /memory/sync-rag
 手动全量同步长期记忆到 RAG 向量库（补齐 Compact 双写前的历史记忆，幂等）。**data** `{total, failed}`。
 
 ### GET /memory/sync-rag/stream
 **SSE 流式同步**（记忆量大时避免单次 HTTP 超时）：每批 upsert 后推送 `progress` 事件 `{done, failed}`，结束推 `done` `{ready, total, synced, failed}`，客户端断开即中止。
+
+> **记忆 GC**：默认 7 天执行一次，清理最近周期内未被召回（`last_recalled_at` 为空或超期）的 5 条记忆（Postgres + RAG 向量双删）。周期由 `gc_interval_days` 配置（记忆页可调）；召回命中会自动更新 `last_recalled_at`（对话召回与 RAG 召回均埋点）。
 
 ---
 
@@ -1895,7 +1909,7 @@ flowchart TD
 
 > **Phase 0（幂等去重）**：群/私聊的 `message_id` 各自独立递增，key 带 `message_type` 前缀；WS 断线重连/多连接时 OneBot 端重复推送的同一消息直接丢弃（`h.msgDedup.SeenBefore`）。
 >
-> **Phase 0.5（系统级群管理）**：`h.GroupMgr.Process`（Go 原生，先于所有 Lua 插件）。白名单/管理员/排除群豁免 → 违禁言论检测（RAG 语义核实首选，高置信直罚 / 模棱两可送 LLM / 低置信有词送 LLM / 无词放行；RAG 不可用降级关键词）；图片刷屏 / +1 复读 `consumed=true` 拦截不进 Agent。详见下方「群管理检测闸门」章节。
+> **Phase 0.5（系统级群管理）**：`h.GroupMgr.Process`（Go 原生，先于所有 Lua 插件）。白名单/管理员/排除群豁免 → 违禁言论检测（RAG 黑白语录语义匹配首选：黑命中处罚 / 白命中放行，均未命中送 LLM 3s 批窗口逐条判定，RAG/LLM 均不可用降级关键词兜底）；图片刷屏 / +1 复读（跳过命令消息）`consumed=true` 拦截不进 Agent。详见下方「群管理检测闸门」章节。
 >
 > `checkReplyStrategyFast` 恒放行：回复策略已收敛为仅 `relevance`（@/命令/提及名字必回由规则快路径保证），LLM 相关性判断延后到 `dispatchToAgent` 的 goroutine 内由 `filterRelevant` 执行（`filterRelevant` → `relevanceBatchEvaluate`）：@/命令/提及名字 → 必回（0 次 LLM）；噪音消息（纯表情/过短/仅 URL）→ 规则丢弃；其余候选合并为**一次** LLM 批量判断（含图消息标注 `[图片]`，单条候选走原分数判断）。判断结果写 Redis（related=15s 对话轮次放宽 / unrelated=30s 冷却），判断并发全局上限 4、超时可配置（relevance_timeout，默认 10s），失败按 `judge_fail_policy`（drop/reply）降级；群聊刷屏（1s≥5 条）时批窗口拉长到 3s 并降级为只回必回消息。
 
@@ -1950,25 +1964,27 @@ flowchart TD
   MSG["群聊消息"] --> EX["豁免检查: 白名单 / 管理员 / 排除群"]
   EX -->|豁免| RET["放行（不进检测）"]
   EX --> CARD["推荐卡片文本化（不再直罚）"]
-  CARD --> RAG["RAG 语义核实（第一核实人, 三档阈值）"]
-  RAG -->|无硬信号| PASS2["放行（防知识/记忆语义干扰）"]
-  RAG -->|score ≥ high_score 且有硬信号| PUNISH["直接处罚"]
-  RAG -->|low < score < high 且有硬信号| LLM["LLM 审核（异常按 fallback_score 分数兜底）"]
-  RAG -->|score ≤ low 且有硬信号| LOW["低置信"]
-  LOW -->|有词/卡片命中| LLM
-  LOW -->|无硬信号| PASS["放行"]
+  CARD --> RAG["RAG 黑白语录语义匹配（第一核实人）"]
+  RAG -->|黑名单命中 score ≥ black_min_score| PUNISH["直接处罚"]
+  RAG -->|白名单命中 score ≥ white_min_score| PASS["放行"]
+  RAG -->|均未达阈值 或 无语录命中| LLM["LLM 批量判定（3s 批窗口, 逐条独立）"]
   RAG -.RAG 不可用.| KW["降级关键词路径（= 旧插件行为）"]
-  LLM -->|判定违规| PUNISH
-  PUNISH --> LEARN["学习闭环: 送审原文入库 + RAG Upsert（越用越准）"]
+  LLM -->|black| PUNISH
+  LLM -->|white| PASS
+  LLM -->|none| PASS2["放行"]
+  LLM -->|请求失败/裁决非法| FC["fail-closed：硬信号直罚, 否则放行"]
+  PUNISH --> LEARN["学习闭环: 送审原文异步入库 + RAG Upsert（越用越准）"]
+  PASS --> LEARN2["学习闭环: 白名单语录异步入库"]
 ```
 
-- 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）
-- 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、三档 RAG 阈值、排除群/白名单/LLM 提示词全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
-- RAG 语义核实三档判定**统一要求硬信号**（命中关键词或推荐卡片）：RAG-Service 向量库与知识/记忆共用，无硬信号时高置信命中可能是知识/记忆的语义干扰，一律放行
+- 三级惩罚：撤回+警告 → 禁言（二次违规 30min）→ 踢出（失败保留并通知管理员）；刷屏警告/复读触发发送配图话术（`//go:embed` 内嵌）；复读检测**跳过命令消息**（`/` 前缀）
+- 图片刷屏（窗口/阈值/禁言时长）、+1 复读（开关/人数）、RAG 黑白阈值（`black_min_score`/`white_min_score`）、LLM 批窗口（`llm_batch_window`，默认 3s）、排除群/白名单/统一提示词（`llm_prompt`）全部**面板可配置**（`group_mgr_configs` 单行表，保存后热重载）
+- RAG 判定**不再要求硬信号**：黑白语录双集合各自独立，黑命中处罚、白命中放行；RAG 服务可用但无语录命中（含知识/记忆向量干扰的命中）一律**送 LLM 判定**，不再误判为“RAG 不可用”降级关键词
+- 学习闭环：LLM 判 black → 黑名单语录（Postgres + RAG 双写），判 white → 白名单语录；异步 goroutine 串行写入（`learnMu`），幂等去重 + 每集合 2000 条上限；RAG 未配置静默跳过（`rag_synced` 仅真实写入成功才置 true）
 - 系统命令：`/groupstats`、`/白名单`、`/豁免`、`/解除豁免`、`/取消豁免`（后注册覆盖插件同名命令，仅管理员）；**/豁免 按群清除违规记录**（不清其他群的三级惩罚阶梯），白名单为全局豁免
-- Web API：`/group-mgr/*`（config/words/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
-- 词库/样本支持 RAG 双写（未配置静默跳过）+ 「同步向量库」全量批量同步（SSE 流式推送进度）；**`rag_synced` 仅真实写入成功才置 true**，删除词条时同步清理派生样本与 RAG 向量
-- 健壮性：LLM 审核提示词带 `<USER_TEXT>` 定界符与指令忽略声明（防注入），判 none 且存在黑/敏感词或卡片硬信号时 **fail-closed 直罚**；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障
+- Web API：`/group-mgr/*`（config/phrases/samples/violations/whitelist/admins/stats/test），详见 [Web API：功能模块](api/features.md)
+- **GC 功能**：长期记忆 GC（默认 7 天，`LongTermMemory.GCIntervalDays` 面板可配）清理最近周期未召回的 5 条（PG + RAG 双删）；白名单语录 GC（默认 7 天，`white_gc_interval_days` 面板可配）清理未命中的 5 条（PG + RAG 双删）
+- 健壮性：LLM 批量判定提示词带 `<USER_TEXT>` 定界符与指令忽略声明（防注入），输出格式契约由代码内提示词固定（不依赖外部 `LLMPrompt` 是否被改）；LLM 请求失败/裁决非法时 fail-closed（有硬信号直罚，否则放行）；违规计数/统计为数据库级原子自增（并发不丢）；群成员管理员判断走 Adapter 带缓存查询（正 10min / 负 60s）；词条软删后重建同名由部分唯一索引 + 软删行复活保障
 
 ## CronJob 注入流
 
@@ -2650,7 +2666,7 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 - 启动时 `loadRAGFromDB`（`cmd/server/main.go`）读 `rag_configs` 单行（**默认未启用**），创建客户端后同时注入 `HagoCenter.RAGClient`（`atomic.Pointer`）与 `Memory.SetRAGClient`（Compact 双写记忆向量）；`Service.OnUpdateRAG` 回调：每次 `PUT /rag/config` 用最新配置重建 `*Client` 并注入，停用/失败置 nil（= 降级开关）
 - 客户端经 `agentOp.GetRAGClient()`（`pluggin.AgentOperator`）供插件动态获取，热更新即时生效
-- **tag 隔离**：知识/记忆/群管理词条·样本共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（`internal/core/ragtag`：`k:`/`m:`/`w:`/`s:`），互不污染
+- **tag 隔离**：知识/记忆/群管理词条·样本·语录共用同一 RAG 实例，用 UUID v5 派生 tag 前缀隔离（`internal/core/ragtag`：`k:`/`m:`/`w:`/`s:`/`wt:`），互不污染；`wt:` 为白名单语录（命中放行），`s:` 为黑名单语录/词条派生样本
 
 ### 降级语义（任何 RAG 故障都不影响主流程）
 
@@ -2658,10 +2674,10 @@ builtin 工具名（如 `send_group_msg`）可能与 MCP 工具同名并同时�
 
 | 调用方 | 首选 | 降级 |
 |--------|------|------|
-| 知识库检索 | RAG 语义检索（命中按分数注入 ≤5 条） | SQL 关键词 + ILIKE 匹配（接入前行为） |
-| 长期记忆召回 | RAG 向量语义 | pg_trgm gram 候选 → 最近条目（三级降级链；pg_trgm 扩展创建失败时自动回退最近条目，不阻断启动） |
-| 群管理违禁检测 | RAG 语义核实（三档阈值） | 关键词路径（= 旧插件行为） |
-| 群管理词条/样本写入 | RAG 可用时同步 Upsert | 未配置静默跳过、失败仅告警（`rag_synced` 仅真实写入成功才置 true） |
+| 知识库检索 | RAG 语义检索（命中按分数注入 ≤5 条；`k=50`） | SQL 关键词 + ILIKE 匹配（接入前行为） |
+| 长期记忆召回 | RAG 向量语义（`k=50`） | pg_trgm gram 候选 → 最近条目（三级降级链；pg_trgm 扩展创建失败时自动回退最近条目，不阻断启动） |
+| 群管理违禁检测 | RAG 黑白语录语义匹配（黑命中 ≥ `black_min_score` 处罚 / 白命中 ≥ `white_min_score` 放行，`k=30`）；RAG 可用但无语录命中 → 送 LLM 批量判定 | 关键词路径（= 旧插件行为，仅 RAG/LLM 均不可用时） |
+| 群管理词条/语录写入 | RAG 可用时同步 Upsert（学习闭环/导入/手动同步） | 未配置静默跳过、失败仅告警（`rag_synced` 仅真实写入成功才置 true） |
 
 ### 接入指南
 
